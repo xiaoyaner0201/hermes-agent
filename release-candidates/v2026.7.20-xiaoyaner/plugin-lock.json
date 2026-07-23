@@ -1,0 +1,59 @@
+{
+  "release_candidate": "v2026.7.20-xiaoyaner",
+  "created_at_utc": "2026-07-23T08:44:26Z",
+  "hermes_base": {
+    "tag": "v2026.7.20",
+    "commit": "3ef6bbd201263d354fd83ec55b3c306ded2eb72a"
+  },
+  "backports": [
+    {
+      "lane": "alias-explicit-provider-guard",
+      "source_repo": "NousResearch/hermes-agent",
+      "source_pr": "https://github.com/NousResearch/hermes-agent/pull/69967",
+      "commits": [
+        "7a0b843edc30c125b1bf7522459f704813335c21",
+        "7cb1c69a61633933503dbbf8b852726881120c3b"
+      ]
+    },
+    {
+      "lane": "shared-session-trusted-sender-envelope",
+      "source_repo": "NousResearch/hermes-agent",
+      "source_pr": "https://github.com/NousResearch/hermes-agent/pull/69980",
+      "commits": [
+        "a09e6db230b064d61c7d34b1630bce0e09872f51",
+        "131d447c9ca3633927b0abd56338200aa73718d0"
+      ]
+    }
+  ],
+  "standalone_plugins": [
+    {
+      "name": "graphiti",
+      "repo": "https://github.com/xiaoyaner0201/hermes-graphiti-memory",
+      "pr": "https://github.com/xiaoyaner0201/hermes-graphiti-memory/pull/1",
+      "commit": "fe4056ef4e2a393291770f4c2b81555327d97fd4",
+      "install_path": "$HERMES_HOME/plugins/graphiti",
+      "install_mode": "symlink_or_copy_external_repo",
+      "core_vendored": false,
+      "smoke": {
+        "unit_tests": "passed",
+        "schemas": ["graphiti_memory", "recall"]
+      }
+    },
+    {
+      "name": "fishaudio-tts",
+      "repo": "https://github.com/xiaoyaner0201/hermes-fishaudio-tts",
+      "pr": "https://github.com/xiaoyaner0201/hermes-fishaudio-tts/pull/1",
+      "commit": "8870c6a64b9c71bb68e0cb04bfc2c9451e60c091",
+      "install_path": "$HERMES_HOME/plugins/fishaudio-tts",
+      "install_mode": "hermes_plugins_install_or_copy_external_repo",
+      "core_vendored": false,
+      "requires_env": ["FISH_AUDIO_API_KEY"],
+      "smoke": {
+        "unit_tests": "passed",
+        "plugin_manager_loaded": true,
+        "tts_registry_provider": "fishaudio"
+      }
+    }
+  ],
+  "live_cutover_performed": false
+}
