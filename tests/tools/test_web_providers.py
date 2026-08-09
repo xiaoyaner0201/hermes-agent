@@ -167,8 +167,18 @@ class TestUnconfiguredErrorEnvelopeParity:
             "FIRECRAWL_API_URL",
             "FIRECRAWL_GATEWAY_URL",
             "TOOL_GATEWAY_DOMAIN",
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_ACCOUNT_ID",
         ):
             monkeypatch.delenv(k, raising=False)
+        # The Codex backend also authenticates via ~/.codex/auth.json — point
+        # it at a nonexistent path so the "unconfigured" state is
+        # deterministic regardless of the developer machine.
+        from plugins.web.codex import provider as codex_provider
+
+        monkeypatch.setattr(
+            codex_provider, "_AUTH_PATH", "/nonexistent/.codex/auth.json"
+        )
 
     def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
         """``web_search_tool`` with no creds returns ``{"error": "Error searching web: ..."}``

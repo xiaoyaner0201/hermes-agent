@@ -3,7 +3,7 @@
 Covers:
 
 - All bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, keenable, xai) instantiate and self-report the expected
+  tavily, firecrawl, keenable, xai, codex) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -45,6 +45,8 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_ACCOUNT_ID",
     ):
         monkeypatch.delenv(k, raising=False)
 

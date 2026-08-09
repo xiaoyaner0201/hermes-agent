@@ -1,0 +1,7 @@
+name: web-codex
+version: 1.0.0
+description: "Codex web search + content extraction via OpenAI's standalone Codex retrieval endpoint. Reuses an existing `codex login` session (~/.codex/auth.json) or CODEX_ACCESS_TOKEN — zero GPT inference tokens."
+author: lgwacker
+kind: backend
+provides_web_providers:
+  - codex
