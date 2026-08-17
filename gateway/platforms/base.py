@@ -121,6 +121,36 @@ def _platform_name(platform) -> str:
     return str(value or "").lower()
 
 
+def message_event_sender_identity(event: "MessageEvent") -> tuple[str, ...] | None:
+    """Return the authenticated participant boundary for event coalescing.
+
+    Shared sessions intentionally omit the participant from their session key,
+    so that key is not sufficient when combining pending text or media.  Prefer
+    the platform's alternate stable identity when present, matching
+    ``build_session_key``.  A DM chat id is a safe fallback; group events with
+    no authenticated participant fail closed and are never coalesced.
+    """
+    source = getattr(event, "source", None)
+    if source is None:
+        return None
+    platform = _platform_name(getattr(source, "platform", None))
+    sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
+    if sender:
+        return (platform, str(sender))
+    if getattr(source, "chat_type", None) in {"dm", "private"}:
+        chat_id = getattr(source, "chat_id", None)
+        if chat_id:
+            return (platform, "dm", str(chat_id))
+    return None
+
+
+def same_message_event_sender(existing: "MessageEvent", event: "MessageEvent") -> bool:
+    """Return True only when two events prove the same sender identity."""
+    existing_sender = message_event_sender_identity(existing)
+    incoming_sender = message_event_sender_identity(event)
+    return existing_sender is not None and existing_sender == incoming_sender
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -2844,6 +2874,13 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        if not same_message_event_sender(existing, event):
+            # A pending slot can hold only one turn.  Replacing is preferable to
+            # combining two participants under the first event's authenticated
+            # sender envelope.  Higher-level queueing may preserve both turns,
+            # but this low-level helper must never create false attribution.
+            pending_messages[session_key] = event
+            return
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -5864,22 +5901,7 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
-
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
-            return None
-
-        existing_sender = _identity(existing)
-        incoming_sender = _identity(event)
-        return existing_sender is not None and existing_sender == incoming_sender
+        return same_message_event_sender(existing, event)
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""

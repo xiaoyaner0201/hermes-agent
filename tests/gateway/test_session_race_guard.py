@@ -151,6 +151,45 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+def test_merge_pending_media_never_combines_different_senders():
+    pending = {}
+    alice = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared",
+        chat_type="group",
+        user_id="alice",
+    )
+    bob = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="shared",
+        chat_type="group",
+        user_id="bob",
+    )
+    session_key = build_session_key(alice, group_sessions_per_user=False)
+    alice_event = MessageEvent(
+        text="Alice photo",
+        message_type=MessageType.PHOTO,
+        source=alice,
+        media_urls=["/tmp/alice.png"],
+        media_types=["image/png"],
+    )
+    bob_event = MessageEvent(
+        text="Bob photo",
+        message_type=MessageType.PHOTO,
+        source=bob,
+        media_urls=["/tmp/bob.png"],
+        media_types=["image/png"],
+    )
+
+    merge_pending_message_event(pending, session_key, alice_event)
+    merge_pending_message_event(pending, session_key, bob_event)
+
+    queued = pending[session_key]
+    assert queued.source.user_id == "bob"
+    assert queued.text == "Bob photo"
+    assert queued.media_urls == ["/tmp/bob.png"]
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()

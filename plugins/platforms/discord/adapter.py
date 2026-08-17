@@ -171,6 +171,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     utf16_len,
     validate_inbound_media_size,
+    message_event_sender_identity,
 )
 from tools.url_safety import is_safe_url
 
@@ -8591,7 +8592,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching.
+        """Session-and-sender-scoped key for text message batching.
 
         Passes ``event.source.profile`` through so routed messages batch
         under the same namespace the agent run will use (e.g.
@@ -8600,12 +8601,21 @@ class DiscordAdapter(BasePlatformAdapter):
         routed profile differs.
         """
         from gateway.session import build_session_key
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        sender = message_event_sender_identity(event)
+        if sender is None:
+            # Shared/group events without authenticated sender metadata must not
+            # coalesce.  Their message id is stable for this short-lived buffer;
+            # object identity is a final synthetic-event fallback.
+            message_id = getattr(event.source, "message_id", None) or id(event)
+            return f"{session_key}:unverified-message:{message_id}"
+        encoded = "|".join(f"{len(part)}:{part}" for part in sender)
+        return f"{session_key}:sender:{encoded}"
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

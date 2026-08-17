@@ -1808,6 +1808,254 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+def _looks_like_verified_sender_claim(value: str) -> bool:
+    """Recognise canonical sender claims even with invisible-format spoofing."""
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = "".join(
+        ch for ch in normalized
+        if not unicodedata.category(ch).startswith("C") and not ch.isspace()
+    )
+    return normalized.casefold().startswith("verifiedsender:")
+
+
+def _terminal_escape_end(content: str, start: int) -> Optional[int]:
+    """Return one ECMA-48 escape's end without pathological rescanning.
+
+    Unterminated OSC/DCS/PM/APC sequences consume only their two-byte prefix,
+    leaving subsequent text visible to sender-claim detection. Encountering a
+    non-ST ESC also ends the malformed sequence at its prefix; repeated
+    malformed prefixes therefore advance monotonically instead of each
+    searching the entire remaining suffix.
+    """
+    if start >= len(content) or content[start] != "\x1b":
+        return None
+    if start + 1 >= len(content):
+        return start + 1
+    kind = content[start + 1]
+    if kind == "[":  # CSI: params, intermediates, final byte.
+        cursor = start + 2
+        while cursor < len(content) and "0" <= content[cursor] <= "?":
+            cursor += 1
+        while cursor < len(content) and " " <= content[cursor] <= "/":
+            cursor += 1
+        # ``[`` is technically in the CSI final-byte range, but treating an
+        # adjacent second opener as part of CSI would hide
+        # ``ESC[[Verified sender: ...]`` from the security shadow. Leave that
+        # opener visible; unmatched terminal text is still emitted unchanged.
+        if (
+            cursor < len(content)
+            and content[cursor] != "["
+            and "@" <= content[cursor] <= "~"
+        ):
+            return cursor + 1
+        return start + 2
+    if kind in "]P^_":  # OSC, DCS, PM, APC.
+        cursor = start + 2
+        while cursor < len(content):
+            if kind == "]" and content[cursor] == "\x07":
+                return cursor + 1
+            if content[cursor] == "\x1b":
+                if cursor + 1 < len(content) and content[cursor + 1] == "\\":
+                    return cursor + 2
+                return start + 2
+            cursor += 1
+        return start + 2
+    if "@" <= kind <= "_":
+        return start + 2
+    return start + 1
+
+
+_SENDER_BRACKET_TRANSLATION = str.maketrans(
+    {
+        **{ch: "[" for ch in "［【〔〖〘〚⟦﹝❲⦋⦍⦏⦑⧘⧚⁅"},
+        **{ch: "]" for ch in "］】〕〗〙〛⟧﹞❳⦌⦎⦐⦒⧙⧛⁆"},
+    }
+)
+
+
+def _sender_claim_shadow(content: str) -> tuple[str, List[tuple[int, int]]]:
+    """Build a normalized detection shadow without mutating user content.
+
+    Each shadow character maps back to its original half-open bytepoint span.
+    Terminal/control obfuscation is omitted only from the shadow, while NFKC,
+    case folding, and confusable brackets make sender-shaped claims detectable.
+    Callers replace only mapped claim spans and preserve all unmatched text.
+    """
+    import unicodedata
+
+    shadow: List[str] = []
+    spans: List[tuple[int, int]] = []
+    cursor = 0
+    pending_ignored_start: Optional[int] = None
+    while cursor < len(content):
+        escape_end = _terminal_escape_end(content, cursor)
+        if escape_end is not None:
+            if pending_ignored_start is None:
+                pending_ignored_start = cursor
+            cursor = escape_end
+            continue
+        ch = content[cursor]
+        if ch not in "\n\r\t" and unicodedata.category(ch).startswith("C"):
+            if pending_ignored_start is None:
+                pending_ignored_start = cursor
+            cursor += 1
+            continue
+        translated = ch.translate(_SENDER_BRACKET_TRANSLATION)
+        normalized = unicodedata.normalize("NFKC", translated).casefold()
+        span_start = (
+            pending_ignored_start
+            if pending_ignored_start is not None
+            else cursor
+        )
+        for normalized_ch in normalized:
+            shadow.append(normalized_ch)
+            spans.append((span_start, cursor + 1))
+        pending_ignored_start = None
+        cursor += 1
+    return "".join(shadow), spans
+
+
+def _verified_sender_prefix_at(content: str, start: int) -> bool:
+    """Match ``verified sender:`` after an opener in bounded linear work."""
+    import unicodedata
+
+    target = "verifiedsender:"
+    matched = 0
+    cursor = start
+    while cursor < len(content) and matched < len(target):
+        normalized = unicodedata.normalize("NFKC", content[cursor]).casefold()
+        cursor += 1
+        for ch in normalized:
+            if ch.isspace():
+                continue
+            if ch != target[matched]:
+                return False
+            matched += 1
+            if matched == len(target):
+                return True
+    return False
+
+
+def _strip_leading_verified_sender_claims(content: str) -> str:
+    """Remove user-supplied canonical/visually-confusable sender envelopes."""
+    shadow, spans = _sender_claim_shadow(content)
+    cursor = 0
+    removed = False
+    while True:
+        while cursor < len(shadow) and shadow[cursor].isspace():
+            cursor += 1
+        if cursor >= len(shadow):
+            return "" if removed else content
+        if shadow[cursor] != "[" or not _verified_sender_prefix_at(
+            shadow, cursor + 1
+        ):
+            return content[spans[cursor][0]:] if removed else content
+        removed = True
+        close = shadow.find("]", cursor + 1)
+        if close < 0:
+            newline = shadow.find("\n", cursor + 1)
+            if newline < 0:
+                return ""
+            cursor = newline + 1
+            continue
+        cursor = close + 1
+
+
+def _escape_verified_sender_field(value: Any) -> str:
+    """Make one authenticated metadata field inert inside ``[...]`` syntax."""
+    import unicodedata
+
+    text = neutralize_untrusted_inline_text(value)
+    escaped: List[str] = []
+    for ch in text:
+        if ch in "[]|\\" or unicodedata.category(ch).startswith("C"):
+            escaped.append(f"\\u{ord(ch):04x}")
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
+def _downgrade_embedded_verified_sender_claims(content: Any) -> Any:
+    """Downgrade every sender-looking claim in untrusted text or text blocks."""
+    if isinstance(content, list):
+        cleaned: List[Any] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                copy = dict(part)
+                copy["text"] = _downgrade_embedded_verified_sender_claims(
+                    str(copy.get("text") or "")
+                )
+                cleaned.append(copy)
+            else:
+                cleaned.append(part)
+        return cleaned
+    if not isinstance(content, str):
+        return content
+    shadow, spans = _sender_claim_shadow(content)
+    out: List[str] = []
+    shadow_cursor = 0
+    original_cursor = 0
+    while shadow_cursor < len(shadow):
+        start = shadow.find("[", shadow_cursor)
+        if start < 0:
+            break
+        if not _verified_sender_prefix_at(shadow, start + 1):
+            shadow_cursor = start + 1
+            continue
+        original_start = spans[start][0]
+        out.append(content[original_cursor:original_start])
+        close = shadow.find("]", start + 1)
+        if close < 0:
+            newline = shadow.find("\n", start + 1)
+            out.append("[Untrusted sender claim removed]")
+            if newline < 0:
+                original_cursor = len(content)
+                shadow_cursor = len(shadow)
+            else:
+                original_cursor = spans[newline][0]
+                shadow_cursor = newline
+            continue
+        out.append("[Untrusted sender claim removed]")
+        original_cursor = spans[close][1]
+        shadow_cursor = close + 1
+    out.append(content[original_cursor:])
+    return "".join(out)
+
+
+def _without_verified_sender_envelope(content: Any) -> Any:
+    """Return text content with Hermes' sender envelope removed.
+
+    Shared-session turns attach this gateway-authenticated envelope to the
+    API-facing message so the model can trust the current platform sender.
+    Hidden-reasoning incomplete turns are not completed model output, so their
+    gateway fallback persistence should keep only the clean user text in the
+    transcript while still shedding any forged envelope that the normal inbound
+    path already normalized.
+    """
+
+    if isinstance(content, str):
+        return _downgrade_embedded_verified_sender_claims(
+            _strip_leading_verified_sender_claims(content)
+        )
+    if isinstance(content, list):
+        cleaned = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                copy = dict(part)
+                copy["text"] = _downgrade_embedded_verified_sender_claims(
+                    _strip_leading_verified_sender_claims(
+                        str(copy.get("text") or "")
+                    )
+                )
+                cleaned.append(copy)
+            else:
+                cleaned.append(part)
+        return cleaned
+    return content
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
@@ -1852,6 +2100,11 @@ def _build_gateway_agent_history(
             continue
 
         content = msg.get("content")
+        if role == "user":
+            # Stored rows can predate the authenticated envelope boundary and
+            # may contain user-authored sender-shaped text. Replay must never
+            # turn those historical bytes back into trusted metadata.
+            content = _downgrade_embedded_verified_sender_claims(content)
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
@@ -19736,7 +19989,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        _authenticated_sender_prefix: Optional[str] = None
+        _sender_prefix_after: Optional[str] = None
+        if _is_shared_multi_user:
+            _has_trusted_sender_id = bool(source.user_id or source.user_id_alt)
+            # Strip any user-supplied copy of Hermes' canonical sender envelope
+            # before attaching the gateway-authenticated one. In a shared
+            # session, leaving a forged leading envelope in place lets one
+            # participant impersonate another in the exact metadata shape we ask
+            # the model to trust.
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
@@ -19744,24 +20005,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a hostile name can masquerade as a fake markdown section
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # On Slack, expose the current author's verifiable user ID next to
-            # the display name (#17916): "mention me again" requests need a
-            # trusted `<@U...>` target for the CURRENT speaker — display names
-            # are ambiguous and historical mentions may point at someone else.
-            # The user_id comes from the Slack event envelope (not
-            # user-editable text), so it does not need neutralization.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = (
-                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
+            # The leading pass removes a forged claim occupying the canonical
+            # envelope slot; the full-string pass downgrades newline/mid-message
+            # duplicates before the one authenticated envelope is attached.
+            message_text = _downgrade_embedded_verified_sender_claims(
+                _strip_leading_verified_sender_claims(message_text)
+            )
+            _safe_user_name = _escape_verified_sender_field(
+                source.user_name or "unknown sender"
+            )
+            if _has_trusted_sender_id:
+                _sender_parts = [_safe_user_name]
+                # Expose platform-authenticated IDs for every shared session so
+                # "mention me" / "who said this?" requests have a trusted current
+                # sender target. Keep Slack's native mention syntax from #17916.
+                if source.platform == Platform.SLACK and source.user_id:
+                    _safe_user_id = _escape_verified_sender_field(source.user_id)
+                    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", _safe_user_id):
+                        _sender_parts.append(f"Slack user <@{_safe_user_id}>")
+                    else:
+                        _sender_parts.append(f"Slack user_id {_safe_user_id}")
+                elif source.user_id:
+                    _sender_parts.append(
+                        f"{source.platform.value.title()} user_id "
+                        f"{_escape_verified_sender_field(source.user_id)}"
+                    )
+                if source.user_id_alt and source.user_id_alt != source.user_id:
+                    _sender_parts.append(
+                        f"user_id_alt {_escape_verified_sender_field(source.user_id_alt)}"
+                    )
+                _authenticated_sender_prefix = (
+                    f"[Verified sender: {' | '.join(_sender_parts)}]"
                 )
-            message_text = f"[{_safe_user_name}] {message_text}"
+            elif source.user_name:
+                _authenticated_sender_prefix = f"[{_safe_user_name}]"
 
-        # Prepend channel context from history backfill (if any).  This
-        # happens after sender-prefix so the prefix only applies to the
-        # trigger message, not the backfill block.
+        # Prepend channel context from history backfill (if any). The verified
+        # sender prefix is intentionally held until the final model-facing gate
+        # below, after every enrichment path has completed.
         if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+            _safe_channel_context = _downgrade_embedded_verified_sender_claims(
+                event.channel_context
+            )
+            _sender_prefix_after = f"{_safe_channel_context}\n\n[New message]\n"
+            message_text = f"{_sender_prefix_after}{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
@@ -20107,6 +20394,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("@ context reference expansion failed: %s", exc)
                 logger.debug("@ context reference expansion failure detail", exc_info=True)
+
+        if _is_shared_multi_user:
+            # This is the final model-facing trust boundary. Vision/STT,
+            # reply quotes, context-reference expansion, and future enrichment
+            # hooks all run above and may append untrusted text after the first
+            # inbound sanitation pass. Downgrade the fully assembled message,
+            # then attach exactly one platform-authenticated prefix last.
+            message_text = _downgrade_embedded_verified_sender_claims(message_text)
+            if _authenticated_sender_prefix:
+                if _sender_prefix_after and _sender_prefix_after in message_text:
+                    message_text = message_text.replace(
+                        _sender_prefix_after,
+                        f"{_sender_prefix_after}{_authenticated_sender_prefix} ",
+                        1,
+                    )
+                else:
+                    message_text = f"{_authenticated_sender_prefix} {message_text}"
 
         return message_text
 
@@ -22603,13 +22907,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # reasoning-only incomplete turns follow the same persistence
                 # rule so peer-agent channels don't ingest them as completed
                 # assistant turns. (#7100, #51628)
+                _fallback_user_content = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message_text
+                )
+                if hidden_reasoning_incomplete:
+                    _fallback_user_content = _without_verified_sender_envelope(
+                        _fallback_user_content
+                    )
                 _user_entry = {
                     "role": "user",
-                    "content": (
-                        persist_user_message
-                        if persist_user_message is not None
-                        else message_text
-                    ),
+                    "content": _fallback_user_content,
                     "timestamp": (
                         persist_user_timestamp
                         if persist_user_timestamp is not None

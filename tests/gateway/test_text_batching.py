@@ -26,11 +26,18 @@ def _make_event(
     platform: Platform,
     chat_id: str = "12345",
     msg_type: MessageType = MessageType.TEXT,
+    user_id: str | None = None,
+    chat_type: str = "dm",
 ) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=msg_type,
-        source=SessionSource(platform=platform, chat_id=chat_id, chat_type="dm"),
+        source=SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+        ),
     )
 
 
@@ -92,6 +99,30 @@ class TestDiscordTextBatching:
         text = adapter.handle_message.call_args[0][0].text
         assert "Part one" in text
         assert "split" in text
+
+    @pytest.mark.asyncio
+    async def test_shared_session_messages_from_different_senders_are_not_merged(self):
+        adapter = _make_discord_adapter()
+        mock_handler = AsyncMock()
+        adapter.handle_message = mock_handler
+        alice = _make_event(
+            "Alice text", Platform.DISCORD, user_id="alice", chat_type="group"
+        )
+        bob = _make_event(
+            "Bob text", Platform.DISCORD, user_id="bob", chat_type="group"
+        )
+
+        assert adapter._text_batch_key(alice) != adapter._text_batch_key(bob)
+        adapter._enqueue_text_event(alice)
+        adapter._enqueue_text_event(bob)
+        await asyncio.sleep(0.2)
+
+        assert mock_handler.call_count == 2
+        dispatched = [call.args[0] for call in mock_handler.call_args_list]
+        assert {(event.source.user_id, event.text) for event in dispatched} == {
+            ("alice", "Alice text"),
+            ("bob", "Bob text"),
+        }
 
 
 # =====================================================================

@@ -16,10 +16,10 @@ def _make_runner(config: GatewayConfig) -> GatewayRunner:
 
 
 @pytest.mark.asyncio
-async def test_preprocess_includes_slack_author_mention_for_shared_thread():
-    """Shared Slack threads expose the current author's verifiable user ID
-    next to the display name so 'mention me again' requests can bind the
-    mention to the CURRENT speaker (#17916)."""
+async def test_preprocess_includes_verified_slack_author_for_shared_thread():
+    """Shared Slack threads expose the authenticated author in the canonical
+    verified-sender envelope so 'mention me again' binds to the current speaker
+    without trusting user-supplied sender text (#17916)."""
     runner = _make_runner(
         GatewayConfig(
             platforms={
@@ -44,6 +44,6 @@ async def test_preprocess_includes_slack_author_mention_for_shared_thread():
         history=[],
     )
 
-    assert result == "[Alice | Slack user <@U123>] mention me again"
+    assert result == "[Verified sender: Alice | Slack user <@U123>] mention me again"
 
 
