@@ -65,6 +65,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    sender_scoped_message_event_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -674,7 +675,8 @@ class SimplexAdapter(BasePlatformAdapter):
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Session-scoped key for text message batching."""
-        return f"{event.source.platform.value}:{event.source.chat_id}"
+        session_key = f"{event.source.platform.value}:{event.source.chat_id}"
+        return sender_scoped_message_event_key(session_key, event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer."""

@@ -136,6 +136,7 @@ from gateway.platforms.base import (
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
     _ssrf_redirect_guard,
+    sender_scoped_message_event_key,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
 
@@ -4270,7 +4271,7 @@ class MatrixAdapter(BasePlatformAdapter):
         """Session-scoped key for text message batching."""
         from gateway.session import build_session_key
 
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get(
                 "group_sessions_per_user", True
@@ -4280,6 +4281,7 @@ class MatrixAdapter(BasePlatformAdapter):
             ),
             profile=self._session_key_profile(event.source),
         )
+        return sender_scoped_message_event_key(session_key, event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer."""

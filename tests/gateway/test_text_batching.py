@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SessionSource,
+    sender_scoped_message_event_key,
+)
 
 
 # =====================================================================
@@ -39,6 +44,91 @@ def _make_event(
             user_id=user_id,
         ),
     )
+
+
+# =====================================================================
+# Shared sender boundary
+# =====================================================================
+
+
+def test_sender_scoped_message_event_key_separates_participants():
+    alice = _make_event(
+        "Alice text", Platform.DISCORD, user_id="alice", chat_type="group"
+    )
+    bob = _make_event(
+        "Bob text", Platform.DISCORD, user_id="bob", chat_type="group"
+    )
+
+    assert sender_scoped_message_event_key("shared-session", alice) != (
+        sender_scoped_message_event_key("shared-session", bob)
+    )
+
+
+def test_sender_scoped_message_event_key_fails_closed_without_sender():
+    first = _make_event("one", Platform.DISCORD, chat_type="group")
+    second = _make_event("two", Platform.DISCORD, chat_type="group")
+
+    assert sender_scoped_message_event_key("shared-session", first) != (
+        sender_scoped_message_event_key("shared-session", second)
+    )
+
+
+def test_all_preingress_text_batch_keys_are_sender_scoped():
+    """Every adapter batch key must restore the sender omitted by shared sessions."""
+    import inspect
+
+    targets = [
+        "gateway.platforms.weixin.WeixinAdapter",
+        "plugins.platforms.discord.adapter.DiscordAdapter",
+        "plugins.platforms.feishu.adapter.FeishuAdapter",
+        "plugins.platforms.matrix.adapter.MatrixAdapter",
+        "plugins.platforms.simplex.adapter.SimplexAdapter",
+        "plugins.platforms.telegram.adapter.TelegramAdapter",
+        "plugins.platforms.wecom.adapter.WeComAdapter",
+        "plugins.platforms.whatsapp.adapter.WhatsAppAdapter",
+    ]
+    for dotted in targets:
+        module_name, class_name = dotted.rsplit(".", 1)
+        module = __import__(module_name, fromlist=[class_name])
+        cls = getattr(module, class_name)
+        source = inspect.getsource(cls._text_batch_key)
+        assert "sender_scoped_message_event_key" in source, dotted
+
+
+def test_preingress_batch_keys_separate_shared_session_senders():
+    """Exercise every platform key with the same session and two senders."""
+    targets = [
+        ("gateway.platforms.weixin.WeixinAdapter", Platform.WEIXIN),
+        ("plugins.platforms.discord.adapter.DiscordAdapter", Platform.DISCORD),
+        ("plugins.platforms.feishu.adapter.FeishuAdapter", Platform.FEISHU),
+        ("plugins.platforms.matrix.adapter.MatrixAdapter", Platform.MATRIX),
+        ("plugins.platforms.simplex.adapter.SimplexAdapter", Platform.LOCAL),
+        ("plugins.platforms.telegram.adapter.TelegramAdapter", Platform.TELEGRAM),
+        ("plugins.platforms.wecom.adapter.WeComAdapter", Platform.WECOM),
+        ("plugins.platforms.whatsapp.adapter.WhatsAppAdapter", Platform.WHATSAPP),
+    ]
+    for dotted, platform in targets:
+        module_name, class_name = dotted.rsplit(".", 1)
+        module = __import__(module_name, fromlist=[class_name])
+        cls = getattr(module, class_name)
+        adapter = object.__new__(cls)
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token="fake",
+            extra={
+                "group_sessions_per_user": False,
+                "thread_sessions_per_user": False,
+            },
+        )
+        if class_name == "TelegramAdapter":
+            adapter._apply_topic_recovery = lambda event: None
+        alice = _make_event(
+            "Alice text", platform, user_id="alice", chat_type="group"
+        )
+        bob = _make_event(
+            "Bob text", platform, user_id="bob", chat_type="group"
+        )
+        assert adapter._text_batch_key(alice) != adapter._text_batch_key(bob), dotted
 
 
 # =====================================================================

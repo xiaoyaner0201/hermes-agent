@@ -126,6 +126,7 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    sender_scoped_message_event_key,
     cache_document_from_bytes,
     cache_image_from_url,
     cache_audio_from_bytes,
@@ -3449,7 +3450,8 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
-        return f"{session_key}:media:{event.message_type.value}"
+        session_key = f"{session_key}:media:{event.message_type.value}"
+        return sender_scoped_message_event_key(session_key, event)
 
     @staticmethod
     def _media_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
@@ -3749,15 +3751,16 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Return the session-scoped key used for Feishu text aggregation."""
+        """Return a session-and-sender-scoped key for Feishu text aggregation."""
         from gateway.session import build_session_key
 
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        return sender_scoped_message_event_key(session_key, event)
 
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:

@@ -172,6 +172,7 @@ from gateway.platforms.base import (
     utf16_len,
     validate_inbound_media_size,
     message_event_sender_identity,
+    sender_scoped_message_event_key,
 )
 from tools.url_safety import is_safe_url
 
@@ -8607,15 +8608,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
-        sender = message_event_sender_identity(event)
-        if sender is None:
-            # Shared/group events without authenticated sender metadata must not
-            # coalesce.  Their message id is stable for this short-lived buffer;
-            # object identity is a final synthetic-event fallback.
-            message_id = getattr(event.source, "message_id", None) or id(event)
-            return f"{session_key}:unverified-message:{message_id}"
-        encoded = "|".join(f"{len(part)}:{part}" for part in sender)
-        return f"{session_key}:sender:{encoded}"
+        return sender_scoped_message_event_key(session_key, event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

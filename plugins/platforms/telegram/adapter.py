@@ -232,6 +232,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    sender_scoped_message_event_key,
     utf16_len,
 )
 from plugins.platforms.telegram.telegram_ids import (
@@ -10032,12 +10033,13 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        return sender_scoped_message_event_key(session_key, event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

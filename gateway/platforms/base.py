@@ -151,6 +151,26 @@ def same_message_event_sender(existing: "MessageEvent", event: "MessageEvent") -
     return existing_sender is not None and existing_sender == incoming_sender
 
 
+def sender_scoped_message_event_key(session_key: str, event: "MessageEvent") -> str:
+    """Scope a short-lived batch key to an authenticated sender.
+
+    Shared session keys deliberately omit the participant. Pre-ingress text or
+    media batching must add that boundary back, otherwise a later participant's
+    chunk can be merged into the first participant's ``MessageEvent`` and inherit
+    the first participant's verified sender envelope.
+    """
+    sender = message_event_sender_identity(event)
+    if sender is None:
+        message_id = (
+            getattr(event, "message_id", None)
+            or getattr(getattr(event, "source", None), "message_id", None)
+            or id(event)
+        )
+        return f"{session_key}:unverified-message:{message_id}"
+    encoded = "|".join(f"{len(part)}:{part}" for part in sender)
+    return f"{session_key}:sender:{encoded}"
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
