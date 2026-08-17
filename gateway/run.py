@@ -1977,6 +1977,61 @@ def _escape_verified_sender_field(value: Any) -> str:
     return "".join(escaped)
 
 
+def _build_authenticated_sender_prefix(source: "SessionSource") -> Optional[str]:
+    """Build the one trusted sender envelope from platform-authenticated fields."""
+    safe_user_name = _escape_verified_sender_field(
+        source.user_name or "unknown sender"
+    )
+    if source.user_id or source.user_id_alt:
+        sender_parts = [safe_user_name]
+        # Keep Slack's native mention syntax from #17916.
+        if source.platform == Platform.SLACK and source.user_id:
+            safe_user_id = _escape_verified_sender_field(source.user_id)
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", safe_user_id):
+                sender_parts.append(f"Slack user <@{safe_user_id}>")
+            else:
+                sender_parts.append(f"Slack user_id {safe_user_id}")
+        elif source.user_id:
+            sender_parts.append(
+                f"{source.platform.value.title()} user_id "
+                f"{_escape_verified_sender_field(source.user_id)}"
+            )
+        if source.user_id_alt and source.user_id_alt != source.user_id:
+            sender_parts.append(
+                f"user_id_alt {_escape_verified_sender_field(source.user_id_alt)}"
+            )
+        return f"[Verified sender: {' | '.join(sender_parts)}]"
+    if source.user_name:
+        return f"[{safe_user_name}]"
+    return None
+
+
+def _attribute_shared_session_text(
+    content: Any,
+    source: "SessionSource",
+    config: Any,
+) -> Any:
+    """Attach authenticated attribution to model-facing shared-session text.
+
+    Normal turns pass through ``_prepare_inbound_message_text``. Busy steer,
+    redirect, and interrupt paths bypass that pipeline and inject directly into
+    a running agent, so they must use this same trust boundary explicitly.
+    """
+    if not isinstance(content, str):
+        return content
+    if not is_shared_multi_user_session(
+        source,
+        group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+        thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+    ):
+        return content
+    cleaned = _downgrade_embedded_verified_sender_claims(
+        _strip_leading_verified_sender_claims(content)
+    )
+    prefix = _build_authenticated_sender_prefix(source)
+    return f"{prefix} {cleaned}" if prefix else cleaned
+
+
 def _downgrade_embedded_verified_sender_claims(content: Any) -> Any:
     """Downgrade every sender-looking claim in untrusted text or text blocks."""
     if isinstance(content, list):
@@ -11093,7 +11148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
-        """Return steerable text for a busy follow-up, transcribing voice first.
+        """Return attributed steer text for a busy follow-up, transcribing voice first.
 
         Fresh and queued voice messages reach the normal inbound STT pipeline,
         but successful steer messages intentionally bypass that queue. Without
@@ -11115,7 +11170,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         text = (event.text or "").strip()
         if not self._pending_event_audio_paths(event):
-            return text
+            return _attribute_shared_session_text(text, event.source, self.config)
 
         adapter = self._adapter_for_source(event.source)
         enriched_text, successful_transcripts = await self._transcribe_and_echo_pending_voice(
@@ -11126,8 +11181,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             log_context="Busy-steer",
         )
         if not successful_transcripts:
-            return text
-        return (enriched_text or text).strip()
+            steer_text = text
+        else:
+            steer_text = (enriched_text or text).strip()
+        return _attribute_shared_session_text(steer_text, event.source, self.config)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -11364,7 +11421,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(running_agent, "redirect")
         ):
             try:
-                redirected = bool(running_agent.redirect((event.text or "").strip()))
+                _redirect_text = _attribute_shared_session_text(
+                    (event.text or "").strip(), event.source, self.config
+                )
+                redirected = bool(running_agent.redirect(_redirect_text))
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
@@ -11413,6 +11473,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif not _interrupt_text and _media_urls:
                     _interrupt_text = _build_media_placeholder(event)
+                _interrupt_text = _attribute_shared_session_text(
+                    _interrupt_text, event.source, self.config
+                )
                 running_agent.interrupt(_interrupt_text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
@@ -18211,9 +18274,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # iterations inside the same agent run, by appending to the
         # last tool result's content. No interrupt, no new user turn,
         # no role-alternation violation.
-        steer_text = event.get_command_args().strip()
-        if not steer_text:
+        raw_steer_text = event.get_command_args().strip()
+        if not raw_steer_text:
             return "Usage: /steer <prompt>"
+        steer_text = _attribute_shared_session_text(
+            raw_steer_text, source, self.config
+        )
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:
@@ -19015,7 +19081,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
-                steer_text = (event.text or "").strip()
+                steer_text = _attribute_shared_session_text(
+                    (event.text or "").strip(), source, self.config
+                )
                 steered = False
                 if (
                     event.message_type == MessageType.TEXT
@@ -19079,7 +19147,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "redirect")
             ):
                 try:
-                    if running_agent.redirect((event.text or "").strip()):
+                    _redirect_text = _attribute_shared_session_text(
+                        (event.text or "").strip(), source, self.config
+                    )
+                    if running_agent.redirect(_redirect_text):
                         logger.debug("PRIORITY redirect for session %s", _quick_key)
                         return None
                 except Exception as exc:
@@ -19101,6 +19172,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
+            _interrupt_text = _attribute_shared_session_text(
+                _interrupt_text, source, self.config
+            )
             running_agent.interrupt(_interrupt_text)
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
@@ -19992,7 +20066,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _authenticated_sender_prefix: Optional[str] = None
         _sender_prefix_after: Optional[str] = None
         if _is_shared_multi_user:
-            _has_trusted_sender_id = bool(source.user_id or source.user_id_alt)
             # Strip any user-supplied copy of Hermes' canonical sender envelope
             # before attaching the gateway-authenticated one. In a shared
             # session, leaving a forged leading envelope in place lets one
@@ -20011,34 +20084,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_text = _downgrade_embedded_verified_sender_claims(
                 _strip_leading_verified_sender_claims(message_text)
             )
-            _safe_user_name = _escape_verified_sender_field(
-                source.user_name or "unknown sender"
-            )
-            if _has_trusted_sender_id:
-                _sender_parts = [_safe_user_name]
-                # Expose platform-authenticated IDs for every shared session so
-                # "mention me" / "who said this?" requests have a trusted current
-                # sender target. Keep Slack's native mention syntax from #17916.
-                if source.platform == Platform.SLACK and source.user_id:
-                    _safe_user_id = _escape_verified_sender_field(source.user_id)
-                    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", _safe_user_id):
-                        _sender_parts.append(f"Slack user <@{_safe_user_id}>")
-                    else:
-                        _sender_parts.append(f"Slack user_id {_safe_user_id}")
-                elif source.user_id:
-                    _sender_parts.append(
-                        f"{source.platform.value.title()} user_id "
-                        f"{_escape_verified_sender_field(source.user_id)}"
-                    )
-                if source.user_id_alt and source.user_id_alt != source.user_id:
-                    _sender_parts.append(
-                        f"user_id_alt {_escape_verified_sender_field(source.user_id_alt)}"
-                    )
-                _authenticated_sender_prefix = (
-                    f"[Verified sender: {' | '.join(_sender_parts)}]"
-                )
-            elif source.user_name:
-                _authenticated_sender_prefix = f"[{_safe_user_name}]"
+            _authenticated_sender_prefix = _build_authenticated_sender_prefix(source)
 
         # Prepend channel context from history backfill (if any). The verified
         # sender prefix is intentionally held until the final model-facing gate
@@ -31169,6 +31215,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
+                                pending_text = _attribute_shared_session_text(
+                                    pending_text, _peek_event.source, self.config
+                                )
                             logger.debug("Interrupt detected from adapter, signaling agent...")
                             agent.interrupt(pending_text)
                             _interrupt_detected.set()
@@ -31451,6 +31500,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                                 elif not _bp_text and _bp_media_urls:
                                     _bp_text = _build_media_placeholder(_bp_event)
+                                _bp_text = _attribute_shared_session_text(
+                                    _bp_text, _bp_event.source, self.config
+                                )
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
@@ -31553,6 +31605,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                                 elif not _bp_text and _bp_media_urls:
                                     _bp_text = _build_media_placeholder(_bp_event)
+                                _bp_text = _attribute_shared_session_text(
+                                    _bp_text, _bp_event.source, self.config
+                                )
                             logger.info(
                                 "Backup interrupt detected for session %s "
                                 "(monitor task state: %s)",
