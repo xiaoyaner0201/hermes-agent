@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -81,6 +82,9 @@ _SIZES = {
     "portrait": "1024x1536",
 }
 
+_MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+_ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/webp"})
+
 
 def _load_openai_config() -> Dict[str, Any]:
     """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
@@ -124,37 +128,100 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
-    """Load image bytes from a URL or local file path.
+def _validated_image_bytes(data: bytes, filename: str) -> Tuple[bytes, str]:
+    """Enforce edit-input size and raster magic bytes for every source shape."""
+    if not data:
+        raise ValueError("Image input is empty")
+    if len(data) > _MAX_INPUT_IMAGE_BYTES:
+        raise ValueError("Image input exceeds 25MB cap")
 
-    Returns ``(data, filename)``. Raises on any network / IO error so the
-    caller can surface a clean error_response.
-    """
+    from agent.image_routing import _sniff_mime_from_bytes
+
+    mime = _sniff_mime_from_bytes(data)
+    if mime not in _ACCEPTED_INPUT_MIME:
+        raise ValueError("Image input does not contain supported image bytes")
+    extension = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+    }[mime]
+    stem, _current_extension = os.path.splitext(filename or "image")
+    safe_name = f"{stem or 'image'}{extension}"
+    return data, safe_name
+
+
+def _load_image_bytes(ref: str) -> Tuple[bytes, str]:
+    """Load and validate image bytes from a URL, data URL, or local path."""
     ref = ref.strip()
     lower = ref.lower()
     if lower.startswith(("http://", "https://")):
-        import requests
+        from tools.url_safety import (
+            create_ssrf_safe_client,
+            is_safe_url,
+            redirect_target_from_response,
+        )
 
-        resp = requests.get(ref, timeout=60)
-        resp.raise_for_status()
-        name = ref.split("?", 1)[0].rsplit("/", 1)[-1] or "image.png"
-        return resp.content, name
+        if not is_safe_url(ref):
+            raise ValueError("Blocked unsafe URL (SSRF protection)")
+
+        def _redirect_guard(response: Any) -> None:
+            target = redirect_target_from_response(response)
+            if target and not is_safe_url(target):
+                raise ValueError("Blocked unsafe redirect (SSRF protection)")
+
+        with create_ssrf_safe_client(
+            timeout=60.0,
+            follow_redirects=True,
+            event_hooks={"response": [_redirect_guard]},
+        ) as client:
+            with client.stream("GET", ref) as resp:
+                resp.raise_for_status()
+                length_header = resp.headers.get("Content-Length")
+                if length_header:
+                    try:
+                        declared_length = int(length_header)
+                    except (TypeError, ValueError):
+                        declared_length = 0
+                    if declared_length > _MAX_INPUT_IMAGE_BYTES:
+                        raise ValueError("Remote image exceeds 25MB cap")
+
+                chunks: List[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > _MAX_INPUT_IMAGE_BYTES:
+                        raise ValueError("Remote image exceeds 25MB cap")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+
+        path_name = os.path.basename(urlparse(ref).path) or "image.png"
+        return _validated_image_bytes(data, path_name)
+
     if lower.startswith("data:"):
         import base64
 
-        header, _, b64 = ref.partition(",")
+        header, separator, b64 = ref.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise ValueError("Image data URL must be base64 encoded")
         ext = "png"
         if "image/" in header:
             ext = header.split("image/", 1)[1].split(";", 1)[0] or "png"
-        return base64.b64decode(b64), f"image.{ext}"
+        try:
+            data = base64.b64decode(b64, validate=True)
+        except Exception as exc:
+            raise ValueError("Image data URL is not valid base64") from exc
+        return _validated_image_bytes(data, f"image.{ext}")
+
     # Local file path — enforce the shared credential-read guard before reading.
     from agent.file_safety import raise_if_read_blocked
 
     raise_if_read_blocked(ref)
     with open(ref, "rb") as fh:
-        data = fh.read()
+        data = fh.read(_MAX_INPUT_IMAGE_BYTES + 1)
     name = os.path.basename(ref) or "image.png"
-    return data, name
+    return _validated_image_bytes(data, name)
 
 
 # ---------------------------------------------------------------------------

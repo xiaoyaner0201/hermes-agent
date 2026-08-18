@@ -107,6 +107,159 @@ class TestModelResolution:
 
 
 class TestSourceImageLoading:
+    def test_load_image_bytes_blocks_private_url(self):
+        with pytest.raises(ValueError, match="unsafe URL"):
+            openai_plugin._load_image_bytes("http://127.0.0.1/internal.png")
+
+    def test_load_image_bytes_uses_ssrf_safe_client(self, monkeypatch):
+        calls = {}
+
+        class _Response:
+            headers = {"Content-Type": "image/png", "Content-Length": str(len(bytes.fromhex(_PNG_HEX)))}
+
+            def raise_for_status(self):
+                return None
+
+            def iter_bytes(self):
+                yield bytes.fromhex(_PNG_HEX)
+
+        class _Stream:
+            def __enter__(self):
+                return _Response()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def stream(self, method, url):
+                calls["stream"] = (method, url)
+                return _Stream()
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
+
+        def _client_factory(**kwargs):
+            calls["client_kwargs"] = kwargs
+            return _Client()
+
+        monkeypatch.setattr("tools.url_safety.create_ssrf_safe_client", _client_factory)
+        data, name = openai_plugin._load_image_bytes("https://example.com/pic.png")
+
+        assert data == bytes.fromhex(_PNG_HEX)
+        assert name == "pic.png"
+        assert calls["stream"] == ("GET", "https://example.com/pic.png")
+        assert calls["client_kwargs"]["follow_redirects"] is True
+
+    def test_load_image_bytes_blocks_unsafe_redirect(self, monkeypatch):
+        checks = []
+        client_kwargs = {}
+
+        class _Client:
+            def __enter__(self):
+                hook = client_kwargs["event_hooks"]["response"][0]
+                response = SimpleNamespace(
+                    status_code=302,
+                    is_redirect=True,
+                    headers={"location": "http://127.0.0.1/internal.png"},
+                    request=SimpleNamespace(url="https://example.com/public.png"),
+                    next_request=None,
+                )
+                hook(response)
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        def _is_safe(url):
+            checks.append(url)
+            return not url.startswith("http://127.0.0.1")
+
+        def _client_factory(**kwargs):
+            client_kwargs.update(kwargs)
+            return _Client()
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", _is_safe)
+        monkeypatch.setattr("tools.url_safety.create_ssrf_safe_client", _client_factory)
+
+        with pytest.raises(ValueError, match="unsafe redirect"):
+            openai_plugin._load_image_bytes("https://example.com/public.png")
+
+        assert checks == [
+            "https://example.com/public.png",
+            "http://127.0.0.1/internal.png",
+        ]
+
+    def test_load_image_bytes_rejects_oversized_content_length(self, monkeypatch):
+        class _Response:
+            headers = {"Content-Type": "image/png", "Content-Length": str(25 * 1024 * 1024 + 1)}
+
+            def raise_for_status(self):
+                return None
+
+            def iter_bytes(self):
+                raise AssertionError("body must not be read")
+
+        class _Stream:
+            def __enter__(self):
+                return _Response()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def stream(self, *_args):
+                return _Stream()
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
+        monkeypatch.setattr("tools.url_safety.create_ssrf_safe_client", lambda **_kw: _Client())
+
+        with pytest.raises(ValueError, match="exceeds 25MB cap"):
+            openai_plugin._load_image_bytes("https://example.com/huge.png")
+
+    def test_load_image_bytes_rejects_non_image_response(self, monkeypatch):
+        class _Response:
+            headers = {"Content-Type": "text/plain"}
+
+            def raise_for_status(self):
+                return None
+
+            def iter_bytes(self):
+                yield b"INTERNAL-SERVICE-SECRET-NOT-AN-IMAGE"
+
+        class _Stream:
+            def __enter__(self):
+                return _Response()
+
+            def __exit__(self, *_exc):
+                return False
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def stream(self, *_args):
+                return _Stream()
+
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda url: True)
+        monkeypatch.setattr("tools.url_safety.create_ssrf_safe_client", lambda **_kw: _Client())
+
+        with pytest.raises(ValueError, match="supported image bytes"):
+            openai_plugin._load_image_bytes("https://example.com/not-image.png")
+
     def test_load_image_bytes_blocks_credential_store(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
