@@ -129,9 +129,11 @@ _MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
 # gpt-image-2's Responses ``input_image`` accepts raster formats only. The
 # shared magic-byte sniffer also recognizes SVG/TIFF/ICO, which the API
 # rejects server-side — gate to this allowlist so unsupported inputs fail
-# locally with a clear error instead of an opaque HTTP 400.
+# locally with a clear error instead of an opaque HTTP 400. GIF is excluded
+# too: the sniffer detects it, but the gpt-image-2 edit contract covers PNG,
+# JPEG, and WEBP only, so accepting it here just defers the same 400.
 _ACCEPTED_INPUT_MIME = frozenset(
-    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+    {"image/png", "image/jpeg", "image/webp"}
 )
 
 

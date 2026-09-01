@@ -167,6 +167,10 @@ class TestGenerate:
         assert caps["modalities"] == ["text", "image"]
         assert caps["max_reference_images"] == 16
 
+    def test_rejects_unsupported_gif_magic(self):
+        # OpenAI's gpt-image-2 edit contract accepts PNG, JPEG, and WEBP only.
+        assert codex_plugin._sniff_image_mime(b"GIF89a" + b"\x00" * 32) is None
+
 
     def test_rejects_non_image_local_source(self, provider, monkeypatch, tmp_path):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
