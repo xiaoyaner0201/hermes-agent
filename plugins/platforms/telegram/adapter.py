@@ -232,6 +232,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_IMAGE_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
+    same_message_event_sender,
     sender_scoped_message_event_key,
     utf16_len,
 )
@@ -10136,8 +10137,14 @@ class TelegramAdapter(BasePlatformAdapter):
     # Photo batching
     # ------------------------------------------------------------------
 
-    def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
-        """Return a batching key for Telegram photos/albums."""
+    def _media_batch_sender_key(self, event: MessageEvent) -> str:
+        """Return the session key with the authenticated sender boundary restored.
+
+        Shared session keys intentionally collapse every participant of a group
+        into one namespace. For media batching that is wrong: two people posting
+        photos at the same moment would merge into a single event attributed to
+        whoever arrived first.
+        """
         from gateway.session import build_session_key
         session_key = build_session_key(
             event.source,
@@ -10145,10 +10152,15 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+        return sender_scoped_message_event_key(session_key, event)
+
+    def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
+        """Return a sender-scoped batching key for Telegram photos/albums."""
+        sender_key = self._media_batch_sender_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            return f"{session_key}:album:{media_group_id}"
-        return f"{session_key}:photo-burst"
+            return f"{sender_key}:album:{media_group_id}"
+        return f"{sender_key}:photo-burst"
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
         """Send a buffered photo burst/album as a single MessageEvent."""
@@ -10181,6 +10193,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         existing = self._pending_photo_batches.get(batch_key)
+        if existing is not None and not same_message_event_sender(existing, event):
+            # Defence in depth: the key is already sender-scoped, but an
+            # anonymised or rewritten source could still collide. Never merge
+            # media from two senders into one event.
+            message_id = (
+                getattr(event, "message_id", None)
+                or getattr(getattr(event, "source", None), "message_id", None)
+                or id(event)
+            )
+            batch_key = f"{batch_key}:sender-boundary:{message_id}"
+            existing = None
         if existing is None:
             self._pending_photo_batches[batch_key] = event
         else:
@@ -10507,29 +10530,38 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="media-group-enqueue")
             return
 
-        existing = self._media_group_events.get(media_group_id)
+        batch_key = f"{self._media_batch_sender_key(event)}:media-group:{media_group_id}"
+        existing = self._media_group_events.get(batch_key)
+        if existing is not None and not same_message_event_sender(existing, event):
+            message_id = (
+                getattr(event, "message_id", None)
+                or getattr(getattr(event, "source", None), "message_id", None)
+                or id(event)
+            )
+            batch_key = f"{batch_key}:sender-boundary:{message_id}"
+            existing = None
         if existing is None:
-            self._media_group_events[media_group_id] = event
+            self._media_group_events[batch_key] = event
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
-        prior_task = self._media_group_tasks.get(media_group_id)
+        prior_task = self._media_group_tasks.get(batch_key)
         if prior_task:
             prior_task.cancel()
 
-        self._media_group_tasks[media_group_id] = asyncio.create_task(
-            self._flush_media_group_event(media_group_id)
+        self._media_group_tasks[batch_key] = asyncio.create_task(
+            self._flush_media_group_event(batch_key)
         )
 
-    async def _flush_media_group_event(self, media_group_id: str) -> None:
+    async def _flush_media_group_event(self, batch_key: str) -> None:
         current_task = asyncio.current_task()
         event = None
         try:
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
-            event = self._media_group_events.pop(media_group_id, None)
+            event = self._media_group_events.pop(batch_key, None)
             if event is None:
                 return
             if self._should_drop_delayed_delivery():
@@ -10544,8 +10576,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._hold_inbound_event(event, where="media-group-flush-cancelled")
             raise
         finally:
-            if self._media_group_tasks.get(media_group_id) is current_task:
-                self._media_group_tasks.pop(media_group_id, None)
+            if self._media_group_tasks.get(batch_key) is current_task:
+                self._media_group_tasks.pop(batch_key, None)
 
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """

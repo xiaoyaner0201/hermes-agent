@@ -530,3 +530,151 @@ class TestHoldInboundAcrossReconnect:
         await adapter._redispatch_held_inbound()
         held_texts = [e.text for e in adapter._held_inbound_events]
         assert held_texts == ["boom", "after"]
+
+
+class TestPhotoBatchingSenderBoundary:
+    """Media batching must never merge two senders into one event.
+
+    Shared group session keys deliberately collapse participants into a single
+    namespace. Media batching keys are derived from those session keys, so
+    without an explicit sender scope two people posting photos at the same
+    moment get merged into one event attributed to whoever arrived first.
+    """
+
+    @staticmethod
+    def _photo_event(caption: str, sender: str, path: str) -> MessageEvent:
+        event = MessageEvent(
+            text=caption,
+            message_type=MessageType.PHOTO,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="12345",
+                chat_type="group",
+                user_id=sender,
+            ),
+        )
+        event.media_urls = [path]
+        event.media_types = ["image/jpeg"]
+        return event
+
+    def test_photo_burst_keys_are_sender_scoped(self):
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter.config.extra["thread_sessions_per_user"] = False
+        msg = SimpleNamespace(media_group_id=None)
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        assert adapter._photo_batch_key(alice, msg) != adapter._photo_batch_key(bob, msg)
+
+    def test_album_keys_are_sender_scoped(self):
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter.config.extra["thread_sessions_per_user"] = False
+        msg = SimpleNamespace(media_group_id="album-1")
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        assert adapter._photo_batch_key(alice, msg) != adapter._photo_batch_key(bob, msg)
+
+    @pytest.mark.asyncio
+    async def test_two_sender_photo_burst_flushes_as_two_events(self):
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter.config.extra["thread_sessions_per_user"] = False
+        adapter._media_batch_delay_seconds = 0
+        msg = SimpleNamespace(media_group_id=None)
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        adapter._enqueue_photo_event(adapter._photo_batch_key(alice, msg), alice)
+        adapter._enqueue_photo_event(adapter._photo_batch_key(bob, msg), bob)
+        await asyncio.gather(*tuple(adapter._pending_photo_batch_tasks.values()))
+
+        assert adapter.handle_message.call_count == 2
+        dispatched = [call.args[0] for call in adapter.handle_message.call_args_list]
+        assert {
+            (event.source.user_id, event.text, tuple(event.media_urls))
+            for event in dispatched
+        } == {
+            ("alice", "alice caption", ("/tmp/a.jpg",)),
+            ("bob", "bob caption", ("/tmp/b.jpg",)),
+        }
+
+    @pytest.mark.asyncio
+    async def test_two_sender_album_flushes_as_two_events(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter.config.extra["thread_sessions_per_user"] = False
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        with patch.object(TelegramAdapter, "MEDIA_GROUP_WAIT_SECONDS", 0):
+            await adapter._queue_media_group_event("album-1", alice)
+            await adapter._queue_media_group_event("album-1", bob)
+            await asyncio.gather(*tuple(adapter._media_group_tasks.values()))
+
+        assert adapter.handle_message.call_count == 2
+        dispatched = [call.args[0] for call in adapter.handle_message.call_args_list]
+        assert {event.source.user_id for event in dispatched} == {"alice", "bob"}
+        assert {tuple(event.media_urls) for event in dispatched} == {
+            ("/tmp/a.jpg",),
+            ("/tmp/b.jpg",),
+        }
+
+    @pytest.mark.asyncio
+    async def test_same_sender_photo_burst_still_merges(self):
+        adapter = _make_adapter()
+        adapter.config.extra["group_sessions_per_user"] = False
+        adapter._media_batch_delay_seconds = 0
+        msg = SimpleNamespace(media_group_id=None)
+        first = self._photo_event("first", "alice", "/tmp/a.jpg")
+        second = self._photo_event("second", "alice", "/tmp/b.jpg")
+
+        adapter._enqueue_photo_event(adapter._photo_batch_key(first, msg), first)
+        adapter._enqueue_photo_event(adapter._photo_batch_key(second, msg), second)
+        await asyncio.gather(*tuple(adapter._pending_photo_batch_tasks.values()))
+
+        adapter.handle_message.assert_called_once()
+        dispatched = adapter.handle_message.call_args.args[0]
+        assert dispatched.source.user_id == "alice"
+        assert dispatched.media_urls == ["/tmp/a.jpg", "/tmp/b.jpg"]
+
+    @pytest.mark.asyncio
+    async def test_photo_enqueue_fails_closed_on_forced_cross_sender_key_collision(self):
+        adapter = _make_adapter()
+        adapter._media_batch_delay_seconds = 0
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        adapter._enqueue_photo_event("forced-collision", alice)
+        adapter._enqueue_photo_event("forced-collision", bob)
+        await asyncio.gather(*tuple(adapter._pending_photo_batch_tasks.values()))
+
+        assert adapter.handle_message.call_count == 2
+        assert {
+            call.args[0].source.user_id for call in adapter.handle_message.call_args_list
+        } == {"alice", "bob"}
+
+    @pytest.mark.asyncio
+    async def test_media_group_enqueue_fails_closed_on_forced_cross_sender_key_collision(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        adapter = _make_adapter()
+        alice = self._photo_event("alice caption", "alice", "/tmp/a.jpg")
+        bob = self._photo_event("bob caption", "bob", "/tmp/b.jpg")
+
+        with (
+            patch.object(TelegramAdapter, "MEDIA_GROUP_WAIT_SECONDS", 0),
+            patch.object(adapter, "_media_batch_sender_key", return_value="forced-collision"),
+        ):
+            await adapter._queue_media_group_event("album-1", alice)
+            await adapter._queue_media_group_event("album-1", bob)
+            await asyncio.gather(*tuple(adapter._media_group_tasks.values()))
+
+        assert adapter.handle_message.call_count == 2
+        assert {
+            call.args[0].source.user_id for call in adapter.handle_message.call_args_list
+        } == {"alice", "bob"}
