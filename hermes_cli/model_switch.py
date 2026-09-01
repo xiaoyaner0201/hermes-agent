@@ -1264,12 +1264,27 @@ def resolve_alias(
     if direct is not None:
         return (direct.provider, direct.model, key)
 
-    # Reverse lookup: match by model ID so full names (e.g. "kimi-k2.5",
-    # "glm-4.7") route through direct aliases instead of falling through
-    # to the catalog/OpenRouter.
-    for alias_name, da in DIRECT_ALIASES.items():
-        if da.model.lower() == key:
+    # Reverse lookup by model ID must stay within the requested provider.
+    # Full names (e.g. "kimi-k2.5", "glm-4.7") should route through direct
+    # aliases instead of falling through to the catalog/OpenRouter -- but
+    # only when the alias belongs to the provider the caller asked for.
+    # Returning another provider's alias here silently re-points the model
+    # at a foreign endpoint (and its credentials), which 401s or bills the
+    # wrong account.
+    reverse_matches = [
+        (alias_name, da)
+        for alias_name, da in DIRECT_ALIASES.items()
+        if da.model.lower() == key
+    ]
+    if reverse_matches:
+        current_provider_norm = str(current_provider or "").strip().lower()
+        for alias_name, da in reverse_matches:
+            if str(da.provider or "").strip().lower() == current_provider_norm:
+                return (da.provider, da.model, alias_name)
+        if not current_provider_norm:
+            alias_name, da = reverse_matches[0]
             return (da.provider, da.model, alias_name)
+        return None
 
     identity = MODEL_ALIASES.get(key)
     if identity is None:
@@ -1769,7 +1784,13 @@ def switch_model(
                 error_message=_ambiguous_alias_message(err),
             )
         if alias_result is not None:
-            _, new_model, resolved_alias = alias_result
+            # PATH A has an explicit target provider. resolve_alias already
+            # refuses cross-provider reverse matches, but a direct alias hit
+            # can still name another provider — accepting its model/alias here
+            # would re-point an explicit `--provider X` switch at Y.
+            alias_provider, alias_model, alias_name = alias_result
+            if str(alias_provider or "").strip().lower() == str(target_provider or "").strip().lower():
+                new_model, resolved_alias = alias_model, alias_name
 
     # =================================================================
     # PATH B: No explicit provider — resolve from model input
@@ -2124,6 +2145,12 @@ def switch_model(
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
+            # Whether the alias endpoint is the same origin the caller already
+            # resolved against. When it is, the api_mode determined above is
+            # already correct for this host and must survive: blanking it
+            # forces a URL re-detection that downgrades an explicitly resolved
+            # mode (e.g. openai_compat -> chat_completions).
+            _same_base_url = _may_reuse_session_credential(base_url, _da.base_url)
             # Credentials above were resolved against the DEFAULT provider.
             # Carrying that key onto the alias's endpoint both 401s and ships
             # the default provider's secret to an unrelated third-party host
@@ -2179,7 +2206,8 @@ def switch_model(
                     or (api_key if _same_host else "")
                     or "no-key-required"
                 )
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
+            if not _same_base_url:
+                api_mode = ""  # clear so determine_api_mode re-detects from URL
             # Upstream's providers.ollama refinement: pick up the
             # configured key only for the configured native root, and drop
             # both the key and the provider-level headers for any other
