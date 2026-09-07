@@ -877,3 +877,149 @@ def test_explicit_mention_only_full_admit_matrix_for_owner_and_stranger(monkeypa
     assert adapter._admit(stranger, _group_msg_with(at_bot)) == "group_policy_rejected"
     assert adapter._admit(owner, make_message(chat_type="p2p")) is None
     assert adapter._admit(stranger, make_message(chat_type="p2p")) == "dm_policy_rejected"
+
+
+# --- Local hardening: fixed reply to unauthorized DM senders -----------------
+
+
+def _fixed_reply_adapter(monkeypatch, *, reply="请拉群", cooldown=600):
+    monkeypatch.delenv("FEISHU_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    adapter = make_adapter_skeleton()
+    install_dedup_state(adapter)
+    adapter._allowed_group_users = frozenset({"ou_owner"})
+    adapter._owner_profile = None
+    adapter.config = SimpleNamespace(extra={})
+    adapter._message_handler = None
+    adapter._unauthorized_dm_reply = reply
+    adapter._unauthorized_dm_reply_cooldown = cooldown
+    sent: list = []
+    processed: list = []
+
+    async def _send(chat_id, content, reply_to=None, metadata=None):
+        sent.append((chat_id, content))
+        return SimpleNamespace(success=True)
+
+    async def _process(**kwargs):
+        processed.append(kwargs)
+
+    adapter.send = _send
+    adapter._process_inbound_message = _process
+    return adapter, sent, processed
+
+
+def _dm_from(open_id, message_id):
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            sender=make_sender(open_id=open_id),
+            message=make_message(message_id=message_id, chat_type="p2p", chat_id=f"oc_dm_{open_id}"),
+        )
+    )
+
+
+def test_stranger_dm_gets_fixed_reply_and_never_reaches_model(monkeypatch):
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch)
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_1")))
+    assert sent == [("oc_dm_ou_stranger", "请拉群")]
+    assert processed == []
+
+
+def test_owner_dm_is_processed_not_auto_replied(monkeypatch):
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch)
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_owner", "om_2")))
+    assert sent == []
+    assert len(processed) == 1
+
+
+def test_stranger_dm_fixed_reply_rate_limited_per_sender(monkeypatch):
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch, cooldown=600)
+    for i in range(3):
+        asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", f"om_{i}")))
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_other", "om_x")))
+    assert [c for c, _ in sent] == ["oc_dm_ou_stranger", "oc_dm_ou_other"]
+    assert processed == []
+
+
+def test_stranger_dm_fixed_reply_resends_after_cooldown(monkeypatch):
+    import asyncio
+
+    adapter, sent, _ = _fixed_reply_adapter(monkeypatch, cooldown=0)
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_a")))
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_b")))
+    assert len(sent) == 2
+
+
+def test_stranger_group_message_gets_no_fixed_reply(monkeypatch):
+    """Fixed reply is DM-only; group traffic is silently dropped as before."""
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch)
+    data = SimpleNamespace(
+        event=SimpleNamespace(
+            sender=make_sender(open_id="ou_stranger"),
+            message=make_message(message_id="om_g", chat_type="group", chat_id="oc_g"),
+        )
+    )
+    asyncio.run(adapter._handle_message_event_data(data))
+    assert sent == [] and processed == []
+
+
+def test_empty_fixed_reply_keeps_silent_drop(monkeypatch):
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch, reply="")
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_1")))
+    assert sent == [] and processed == []
+
+
+def test_fixed_reply_send_failure_is_swallowed(monkeypatch):
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch)
+
+    async def _boom(*a, **k):
+        raise RuntimeError("network")
+
+    adapter.send = _boom
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_1")))
+    assert processed == []
+
+
+def test_fixed_reply_settings_and_yaml_bridge(monkeypatch):
+    import os
+
+    from plugins.platforms.feishu.adapter import FeishuAdapter, _apply_yaml_config
+
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
+    monkeypatch.delenv("FEISHU_UNAUTHORIZED_DM_REPLY", raising=False)
+    s = FeishuAdapter._load_settings(extra={})
+    assert s.unauthorized_dm_reply == "" and s.unauthorized_dm_reply_cooldown_seconds == 600
+    s = FeishuAdapter._load_settings(extra={"unauthorized_dm_reply": " hi ", "unauthorized_dm_reply_cooldown_seconds": 5})
+    assert s.unauthorized_dm_reply == "hi" and s.unauthorized_dm_reply_cooldown_seconds == 5
+    _apply_yaml_config({}, {"unauthorized_dm_reply": "from yaml"})
+    assert os.environ.get("FEISHU_UNAUTHORIZED_DM_REPLY") == "from yaml"
+    assert FeishuAdapter._load_settings(extra={}).unauthorized_dm_reply == "from yaml"
+
+
+def test_fixed_reply_wins_over_gateway_pair_forward(monkeypatch):
+    """Even when the gateway would pair, the adapter's fixed reply takes precedence."""
+    import asyncio
+
+    adapter, sent, processed = _fixed_reply_adapter(monkeypatch)
+    runner = SimpleNamespace()
+    runner._get_unauthorized_dm_behavior = lambda platform, *, profile=None: "pair"
+
+    class _Handler:
+        __self__ = runner
+
+    adapter._message_handler = _Handler()
+    asyncio.run(adapter._handle_message_event_data(_dm_from("ou_stranger", "om_1")))
+    assert sent == [("oc_dm_ou_stranger", "请拉群")]
+    assert processed == []

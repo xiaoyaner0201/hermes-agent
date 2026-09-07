@@ -442,6 +442,10 @@ class FeishuAdapterSettings:
     # own open_id / user_id counts as "@ the bot". `@_all` (@everyone) and the
     # display-name fallback no longer wake the agent.
     explicit_mention_only: bool = False
+    # Local hardening: fixed text sent (from the adapter, never the model) to a
+    # DM sender outside FEISHU_ALLOWED_USERS. Empty = keep the silent drop.
+    unauthorized_dm_reply: str = ""
+    unauthorized_dm_reply_cooldown_seconds: int = 600
 
 
 @dataclass
@@ -1678,6 +1682,12 @@ class FeishuAdapter(BasePlatformAdapter):
             explicit_mention_only=_to_boolean(
                 extra.get("explicit_mention_only", os.getenv("FEISHU_EXPLICIT_MENTION_ONLY", "false"))
             ),
+            unauthorized_dm_reply=str(
+                extra.get("unauthorized_dm_reply") or os.getenv("FEISHU_UNAUTHORIZED_DM_REPLY", "")
+            ).strip(),
+            unauthorized_dm_reply_cooldown_seconds=_coerce_required_int(
+                extra.get("unauthorized_dm_reply_cooldown_seconds"), default=600, min_value=0
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1711,6 +1721,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
         self._explicit_mention_only = settings.explicit_mention_only
+        self._unauthorized_dm_reply = settings.unauthorized_dm_reply
+        self._unauthorized_dm_reply_cooldown = settings.unauthorized_dm_reply_cooldown_seconds
+        # sender open_id → monotonic time of last fixed reply (bounded, in-memory)
+        self._unauthorized_dm_reply_sent: "OrderedDict[str, float]" = OrderedDict()
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -2656,6 +2670,11 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         reason = self._admit(sender, message)
+        if reason == "dm_policy_rejected" and self._unauthorized_dm_reply:
+            # Local fixed reply wins over the gateway's unauthorized_dm_behavior:
+            # it must not depend on pairing state or the model.
+            await self._send_unauthorized_dm_reply(sender, message)
+            return
         if reason == "dm_policy_rejected" and self._should_forward_unauthorized_dm():
             # The gateway owns the unauthorized-DM reply (pairing code or a
             # configured decline). Dropping here would make Feishu the only
@@ -4491,6 +4510,33 @@ class FeishuAdapter(BasePlatformAdapter):
             extra = getattr(getattr(self, "config", None), "extra", None) or {}
             behavior = str(extra.get("unauthorized_dm_behavior", "")).strip().lower()
         return bool(behavior) and behavior != "ignore"
+
+    async def _send_unauthorized_dm_reply(self, sender: Any, message: Any) -> None:
+        """Fixed, model-free reply to a DM sender outside the allowlist.
+
+        Runs entirely in the adapter: no MessageEvent, no session, no agent
+        turn, no media download, no sender-name lookup. Rate-limited per
+        sender so a burst of messages gets one reply per cooldown window.
+        """
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        sender_key = next(iter(sorted(_sender_identity(sender))), "")
+        if not chat_id or not sender_key:
+            logger.debug("[Feishu] unauthorized DM without chat_id/sender; dropping")
+            return
+        now = time.monotonic()
+        last = self._unauthorized_dm_reply_sent.get(sender_key)
+        if last is not None and (now - last) < self._unauthorized_dm_reply_cooldown:
+            logger.debug("[Feishu] unauthorized DM from %s within cooldown; dropping", sender_key)
+            return
+        self._unauthorized_dm_reply_sent[sender_key] = now
+        self._unauthorized_dm_reply_sent.move_to_end(sender_key)
+        while len(self._unauthorized_dm_reply_sent) > 512:
+            self._unauthorized_dm_reply_sent.popitem(last=False)
+        logger.info("[Feishu] unauthorized DM from %s; sending fixed reply", sender_key)
+        try:
+            await self.send(chat_id, self._unauthorized_dm_reply)
+        except Exception:
+            logger.warning("[Feishu] fixed unauthorized-DM reply failed", exc_info=True)
     def _admit_reaction(
         self, user_id_obj: Any, *, chat_id: str, chat_type: str
     ) -> Optional[RejectReason]:
@@ -6000,6 +6046,16 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
     if "explicit_mention_only" in feishu_cfg and not os.getenv("FEISHU_EXPLICIT_MENTION_ONLY"):
         os.environ["FEISHU_EXPLICIT_MENTION_ONLY"] = str(feishu_cfg["explicit_mention_only"]).lower()
+    if "unauthorized_dm_reply" in feishu_cfg and not os.getenv("FEISHU_UNAUTHORIZED_DM_REPLY"):
+        os.environ["FEISHU_UNAUTHORIZED_DM_REPLY"] = str(feishu_cfg["unauthorized_dm_reply"])
+    # Non-secret numeric knob: seed it into PlatformConfig.extra (the hook may
+    # return a dict that load_gateway_config merges into extra).
+    if "unauthorized_dm_reply_cooldown_seconds" in feishu_cfg:
+        return {
+            "unauthorized_dm_reply_cooldown_seconds": feishu_cfg[
+                "unauthorized_dm_reply_cooldown_seconds"
+            ]
+        }
     return None
 
 

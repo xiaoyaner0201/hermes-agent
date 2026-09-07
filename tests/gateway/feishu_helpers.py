@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -51,6 +52,9 @@ def make_adapter_skeleton(
     adapter._allow_bots = allow_bots
     adapter._require_mention = require_mention
     adapter._explicit_mention_only = explicit_mention_only
+    adapter._unauthorized_dm_reply = ""
+    adapter._unauthorized_dm_reply_cooldown = 600
+    adapter._unauthorized_dm_reply_sent = OrderedDict()
     return adapter
 
 
