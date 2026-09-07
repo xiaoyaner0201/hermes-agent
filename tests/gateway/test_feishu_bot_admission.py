@@ -788,3 +788,92 @@ def test_dm_reaction_from_allowlisted_user_is_routed(monkeypatch):
     adapter = _reaction_adapter()
     adapter._allowed_group_users = frozenset({"ou_owner"})
     assert len(_run_reaction(adapter, "ou_owner", chat_id="oc_dm", chat_type="p2p")) == 1
+
+
+# --- Local hardening: explicit_mention_only ---------------------------------
+
+
+def _group_msg_with(mentions, content=""):
+    m = make_message(chat_type="group", chat_id="oc_g", mentions=mentions)
+    m.content = content
+    return m
+
+
+def test_explicit_mention_only_ignores_at_all():
+    adapter = make_adapter_skeleton(explicit_mention_only=True)
+    msg = _group_msg_with(mentions=None, content='{"text":"@_all hello"}')
+    assert adapter._mentions_self(msg) is False
+
+
+def test_default_mode_still_treats_at_all_as_mention():
+    adapter = make_adapter_skeleton(explicit_mention_only=False)
+    msg = _group_msg_with(mentions=None, content='{"text":"@_all hello"}')
+    assert adapter._mentions_self(msg) is True
+
+
+def test_explicit_mention_only_ignores_name_only_match():
+    adapter = make_adapter_skeleton(explicit_mention_only=True)
+    adapter._bot_name = "Bot"
+    mention = SimpleNamespace(key="@_user_1", name="Bot", id=SimpleNamespace(open_id="", user_id=""))
+    assert adapter._mentions_self(_group_msg_with([mention])) is False
+
+
+def test_explicit_mention_only_accepts_open_id_match():
+    adapter = make_adapter_skeleton(explicit_mention_only=True, bot_open_id="ou_me")
+    mention = SimpleNamespace(key="@_user_1", name="whatever", id=SimpleNamespace(open_id="ou_me", user_id=""))
+    assert adapter._mentions_self(_group_msg_with([mention])) is True
+
+
+def test_explicit_mention_only_rejects_other_open_id():
+    adapter = make_adapter_skeleton(explicit_mention_only=True, bot_open_id="ou_me")
+    mention = SimpleNamespace(key="@_user_1", name="Bot", id=SimpleNamespace(open_id="ou_other", user_id=""))
+    assert adapter._mentions_self(_group_msg_with([mention])) is False
+
+
+def test_explicit_mention_only_without_self_ids_never_matches():
+    adapter = make_adapter_skeleton(explicit_mention_only=True, bot_open_id="", bot_user_id="")
+    adapter._bot_name = "Bot"
+    mention = SimpleNamespace(key="@_user_1", name="Bot", id=SimpleNamespace(open_id="ou_x", user_id=""))
+    assert adapter._mentions_self(_group_msg_with([mention])) is False
+
+
+def test_explicit_mention_only_settings_from_env_and_extra(monkeypatch):
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
+    monkeypatch.delenv("FEISHU_EXPLICIT_MENTION_ONLY", raising=False)
+    assert FeishuAdapter._load_settings(extra={}).explicit_mention_only is False
+    monkeypatch.setenv("FEISHU_EXPLICIT_MENTION_ONLY", "true")
+    assert FeishuAdapter._load_settings(extra={}).explicit_mention_only is True
+    assert FeishuAdapter._load_settings(extra={"explicit_mention_only": False}).explicit_mention_only is False
+
+
+def test_explicit_mention_only_yaml_bridge(monkeypatch):
+    import os
+
+    from plugins.platforms.feishu.adapter import _apply_yaml_config
+
+    monkeypatch.delenv("FEISHU_EXPLICIT_MENTION_ONLY", raising=False)
+    _apply_yaml_config({}, {"explicit_mention_only": True})
+    assert os.environ.get("FEISHU_EXPLICIT_MENTION_ONLY") == "true"
+    monkeypatch.setenv("FEISHU_EXPLICIT_MENTION_ONLY", "false")
+    _apply_yaml_config({}, {"explicit_mention_only": True})
+    assert os.environ.get("FEISHU_EXPLICIT_MENTION_ONLY") == "false"  # env wins
+
+
+def test_explicit_mention_only_full_admit_matrix_for_owner_and_stranger(monkeypatch):
+    """Owner @bot → admitted; owner @all / no-@ → rejected; stranger @bot → rejected."""
+    monkeypatch.delenv("FEISHU_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+    adapter = make_adapter_skeleton(explicit_mention_only=True, bot_open_id="ou_me", group_policy="allowlist")
+    adapter._allowed_group_users = frozenset({"ou_owner"})
+    at_bot = [SimpleNamespace(key="@_user_1", name="Bot", id=SimpleNamespace(open_id="ou_me", user_id=""))]
+    owner = make_sender(open_id="ou_owner")
+    stranger = make_sender(open_id="ou_stranger")
+    assert adapter._admit(owner, _group_msg_with(at_bot)) is None
+    assert adapter._admit(owner, _group_msg_with(None, '{"text":"@_all"}')) == "group_policy_rejected"
+    assert adapter._admit(owner, _group_msg_with(None)) == "group_policy_rejected"
+    assert adapter._admit(stranger, _group_msg_with(at_bot)) == "group_policy_rejected"
+    assert adapter._admit(owner, make_message(chat_type="p2p")) is None
+    assert adapter._admit(stranger, make_message(chat_type="p2p")) == "dm_policy_rejected"

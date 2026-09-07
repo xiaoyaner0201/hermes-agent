@@ -34,6 +34,7 @@ def make_adapter_skeleton(
     allow_bots: str = "none",
     require_mention: bool = True,
     group_policy: str = "allowlist",
+    explicit_mention_only: bool = False,
 ) -> Any:
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -49,6 +50,7 @@ def make_adapter_skeleton(
     adapter._allowed_group_users = frozenset()
     adapter._allow_bots = allow_bots
     adapter._require_mention = require_mention
+    adapter._explicit_mention_only = explicit_mention_only
     return adapter
 
 

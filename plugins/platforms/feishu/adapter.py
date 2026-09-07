@@ -438,6 +438,10 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # Local hardening: when True, only a mention that resolves to this bot's
+    # own open_id / user_id counts as "@ the bot". `@_all` (@everyone) and the
+    # display-name fallback no longer wake the agent.
+    explicit_mention_only: bool = False
 
 
 @dataclass
@@ -1671,6 +1675,9 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            explicit_mention_only=_to_boolean(
+                extra.get("explicit_mention_only", os.getenv("FEISHU_EXPLICIT_MENTION_ONLY", "false"))
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1703,6 +1710,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._explicit_mention_only = settings.explicit_mention_only
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -4561,11 +4569,15 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
         raw_content = getattr(message, "content", "") or ""
+        mentions = getattr(message, "mentions", None) or []
+        if self._explicit_mention_only:
+            # Strict mode: only an ID-resolved mention of this bot counts.
+            # @_all is not "@ me", and a display-name match is spoofable.
+            return self._message_mentions_bot_by_id(mentions)
+        # @_all is Feishu's @everyone placeholder.
         if "@_all" in raw_content:
             return True
-        mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
             return True
         normalized = normalize_feishu_message(
@@ -4575,6 +4587,20 @@ class FeishuAdapter(BasePlatformAdapter):
             bot=self._bot_identity(),
         )
         return self._post_mentions_bot(normalized.mentions)
+
+    def _message_mentions_bot_by_id(self, mentions: List[Any]) -> bool:
+        """ID-only mention match: open_id, then user_id. No name fallback."""
+        if not (self._bot_open_id or self._bot_user_id):
+            return False
+        for mention in mentions or []:
+            mention_id = getattr(mention, "id", None)
+            open_id = (getattr(mention_id, "open_id", None) or "").strip()
+            user_id = (getattr(mention_id, "user_id", None) or "").strip()
+            if open_id and self._bot_open_id and open_id == self._bot_open_id:
+                return True
+            if user_id and self._bot_user_id and user_id == self._bot_user_id:
+                return True
+        return False
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
         # IDs trump names: when both sides have open_id (or both user_id),
@@ -5972,6 +5998,8 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     """
     if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+    if "explicit_mention_only" in feishu_cfg and not os.getenv("FEISHU_EXPLICIT_MENTION_ONLY"):
+        os.environ["FEISHU_EXPLICIT_MENTION_ONLY"] = str(feishu_cfg["explicit_mention_only"]).lower()
     return None
 
 
