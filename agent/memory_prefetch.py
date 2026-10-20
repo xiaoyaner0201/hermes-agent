@@ -93,20 +93,24 @@ class DeferredPrefetch:
             self._lookups[provider.name] = lookup
             lookup.thread.start()
 
-        lookup.thread.join(timeout)
-        with self._lock:
-            if lookup.thread.is_alive():
+        try:
+            lookup.thread.join(timeout)
+            with self._lock:
+                if lookup.thread.is_alive():
+                    logger.warning(
+                        "Memory provider '%s' prefetch timed out after %.1fs; "
+                        "deferring its result until a later turn in the same conversation",
+                        provider.name, timeout,
+                    )
+                    current = ""
+                else:
+                    self._lookups.pop(provider.name, None)
+                    current = lookup.text
+                return _merge_recall(earlier, current) if lookup.eligible else ""
+        finally:
+            # An interrupted waiter must not strand the slot; a live worker still fences it.
+            with self._lock:
                 lookup.waiting = False
-                logger.warning(
-                    "Memory provider '%s' prefetch timed out after %.1fs; "
-                    "deferring its result until a later turn in the same conversation",
-                    provider.name, timeout,
-                )
-                current = ""
-            else:
-                self._lookups.pop(provider.name, None)
-                current = lookup.text
-            return _merge_recall(earlier, current) if lookup.eligible else ""
 
     def _claim_completed(self, provider: MemoryProvider, session_id: str, home: str) -> str | None:
         """Called under the lock. None means busy; empty string means no eligible carry."""
