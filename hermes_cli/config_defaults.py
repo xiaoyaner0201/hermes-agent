@@ -1312,16 +1312,16 @@ DEFAULT_CONFIG = {
         "memory_enabled": True,
         "user_profile_enabled": True,
         "prefetch_spill_enabled": False,  # External recall opt-in to hooks.output_spill.
+        "external_prefetch_timeout": 8.0,  # Maximum wait per external provider (seconds).
+        "defer_prefetch_on_timeout": False,  # Carry late recall to a later turn in the same conversation.
         # Approval gate for memory writes on BOTH foreground turns and the background review fork.
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
-        # Periodic built-in memory review; 0 when an external provider auto-extracts.
-        "nudge_interval": 10,
-        # One external provider: bundled (retaindb, byterover) or catalog-installed (honcho,
-        # hindsight, supermemory, mem0, openviking, holographic). Empty = built-in only.
+        "nudge_interval": 10,  # Built-in review cadence; 0 when an external provider auto-extracts.
+        # One external provider (bundled or catalog-installed); empty = built-in only.
         "provider": "",
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a

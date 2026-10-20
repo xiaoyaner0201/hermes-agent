@@ -31,8 +31,8 @@ memory:
 
 When a memory provider is active, Hermes automatically:
 
-1. **Injects provider context** into the system prompt (what the provider knows)
-2. **Prefetches relevant memories** before each turn (background, non-blocking)
+1. **Adds static provider instructions** to the system prompt
+2. **Prefetches relevant memories** for the current user turn (provider-managed background recall or a bounded synchronous wait)
 3. **Syncs conversation turns** to the provider after each response
 4. **Extracts memories on session end** (for providers that support it)
 5. **Mirrors built-in memory writes** to the external provider
@@ -41,6 +41,52 @@ When a memory provider is active, Hermes automatically:
 The built-in memory (MEMORY.md / USER.md) continues to work exactly as before. The external provider is additive.
 
 Everything Hermes hands a provider (turns, the transcript including tool output, recall queries, session-end and pre-compression transcripts, mirrored memory writes, delegation results and the arguments of the provider's own tools) passes through the same secret scrub as chat-platform and cron delivery first, so a key echoed into tool output is masked before the provider can store it. Like that delivery scrub it applies even with `security.redact_secrets: false`. Credentials with no recognisable shape (an arbitrary password, an opaque token outside a `key=value` or `Bearer` context) are not detected; your local transcript keeps the original text.
+
+### External recall deadline and late results
+
+The outer wait for each external provider is configured in `config.yaml`:
+
+```yaml
+memory:
+  external_prefetch_timeout: 8.0       # seconds; default
+  defer_prefetch_on_timeout: false    # default: discard late recall
+```
+
+To allow a longer wait and carry late synchronous recall forward, explicitly set
+`external_prefetch_timeout: 12.0` and `defer_prefetch_on_timeout: true`. The timeout
+must be a finite positive YAML number within the platform's thread-wait limit;
+booleans, strings (including `"12"`), zero and invalid values fall back to 8 seconds
+with a warning. Only the YAML boolean `true` enables carry-forward; quoted strings
+and numbers do not. These settings are captured when the memory manager is created
+at session startup. Editing the file does not change an existing manager (including
+one reused across turns); start a new session with a new manager, or restart the
+owning CLI/gateway process, to apply changes.
+
+With carry-forward enabled:
+
+- A lookup that finishes within the deadline is injected normally for the current
+  question. A timeout does not cancel the worker.
+- While that worker is still running, subsequent questions skip another lookup for
+  that provider. Once it finishes, its nonempty successful result is consumed at most
+  once on the next eligible memory-prefetch turn in the same conversation, manager,
+  profile and provider instance. Empty session IDs do not carry late results.
+- The carried text is explicitly labelled as earlier-turn memory for a previous
+  question, not an answer to the current question. Hermes also starts a fresh lookup
+  for the current question after the old worker completes. If both return text, the
+  current-question section is labelled separately; identical old/current text is
+  included only once, as current recall.
+- Ready earlier-turn context is still delivered if the fresh lookup times out or
+  fails. That new timed-out lookup can in turn be carried to a later question.
+- Errors and empty results are not memories. Switching sessions/profiles, ending a
+  session or shutting down discards pending carry; no past message or system prompt
+  is edited. Trivial prompts and bare skill invocations still skip prefetch as before.
+
+This is a generic core option: for example, it supports Hindsight's synchronous
+`recall_sync: true` without changing the plugin. Provider-managed async recall and
+`queue_prefetch` keep their existing behavior. Built-in memory is unaffected, and
+external recall still uses the existing secret-egress scrub and registration-time
+`memory.prefetch_spill_enabled`/`hooks.output_spill` policy. There is no durable queue:
+only one outstanding lookup/result slot per provider and manager, lost on restart.
 
 ## Available Providers
 

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.redact import redact_for_egress
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_prefetch import DeferredPrefetch, EXTERNAL_PREFETCH_TIMEOUT_S, validate_prefetch_timeout
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
 from tools.registry import tool_error
@@ -31,7 +32,6 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # shutdown_all() drain bound; workers are daemon threads so a wedged provider never
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
-_EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -395,16 +395,17 @@ class MemoryManager:
     swallows per-provider exceptions.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(self, *, external_prefetch_timeout: Optional[float] = None,
+                 defer_prefetch_on_timeout: bool = False) -> None:
         self._providers: list[MemoryProvider] = []
         self._tool_to_provider: dict[str, MemoryProvider] = {}
         self._external_prefetch_spill_config: Optional[dict[str, Any]] = None
         self._has_external: bool = False
-        timeout = external_prefetch_timeout
-        timeout = _EXTERNAL_PREFETCH_TIMEOUT_S if timeout is None else float(timeout)
-        if timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
-        self._external_prefetch_timeout = timeout
+        self._external_prefetch_timeout = validate_prefetch_timeout(
+            EXTERNAL_PREFETCH_TIMEOUT_S if external_prefetch_timeout is None else external_prefetch_timeout
+        )
+        self._defer_prefetch_on_timeout = defer_prefetch_on_timeout is True
+        self._deferred_prefetch = DeferredPrefetch() if self._defer_prefetch_on_timeout else None
         self._external_prefetch_threads: dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Single-worker background executor for end-of-turn sync/prefetch, created lazily so
@@ -520,11 +521,25 @@ class MemoryManager:
         return "\n\n".join(p for p in parts if p and p.strip())
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
-        """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
-        call keeps running on its daemon thread and the provider is skipped on later turns until it returns."""
+        """Bound external recall; optionally deliver completed late recall on a later turn."""
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
+        if self._deferred_prefetch is not None:
+            result = self._deferred_prefetch.run(
+                provider, query, session_id=session_id, timeout=self._external_prefetch_timeout,
+            )
+        else:
+            result = self._prefetch_external(provider, query, session_id=session_id)
+        if result and result.strip():
+            # Both current and deferred recall use the registration-time spill policy.
+            result = spill_if_oversized(
+                result, session_id=session_id, source=f"{provider.name} memory prefetch",
+                config=self._external_prefetch_spill_config,
+            )
+        return result
 
+    def _prefetch_external(self, provider: MemoryProvider, query: str, *, session_id: str) -> str:
+        """Legacy default: discard late results and skip a provider until its worker returns."""
         result_box: dict[str, Any] = {}
 
         def _run() -> None:
@@ -555,15 +570,7 @@ class MemoryManager:
                 self._external_prefetch_threads.pop(provider.name, None)
         if "error" in result_box:
             raise result_box["error"]
-        result = result_box.get("value", "")
-        if result and result.strip():
-            # Opt-in spill limits recall replayed with the user turn's api_content;
-            # the registration snapshot leaves provider-ranked results intact by default.
-            result = spill_if_oversized(
-                result, session_id=session_id, source=f"{provider.name} memory prefetch",
-                config=self._external_prefetch_spill_config,
-            )
-        return result
+        return result_box.get("value", "")
 
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
@@ -740,6 +747,8 @@ class MemoryManager:
         self._each_provider("on_turn_start failed", _tick)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        if self._deferred_prefetch is not None:
+            self._deferred_prefetch.invalidate()
         messages = _redact_messages_for_egress(messages or [])
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
                             exc_info=True)
@@ -784,6 +793,8 @@ class MemoryManager:
         (``/undo``): same id, truncated transcript."""
         if not new_session_id:
             return
+        if self._deferred_prefetch is not None:
+            self._deferred_prefetch.invalidate()
         if rewound:  # forward only when set so it never pollutes providers' **kwargs
             kwargs["rewound"] = True
         self._each_provider(
@@ -943,6 +954,8 @@ class MemoryManager:
 
     def shutdown_all(self) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
+        if self._deferred_prefetch is not None:
+            self._deferred_prefetch.invalidate(close=True)
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
                             providers=self._providers[::-1])

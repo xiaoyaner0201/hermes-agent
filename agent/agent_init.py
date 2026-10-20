@@ -1302,13 +1302,9 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
-    # built-in store so the memory tool never sees store=None.
-    # Flush/background agents can still pass enabled_toolsets=["memory"] so the built-in file store exists
-    # and the memory tool does not fail with store=None (#65429). A toolset on disabled_toolsets is not a
-    # request: a caller that denylists memory while its default toolset still names it must not get
-    # MEMORY.md loaded by an enabled-only check. (Cron agents now run with skip_memory=False and take the
-    # normal path here.)
+    mem_config = {}
+    # skip_memory skips the external provider, but an explicitly requested (not disabled)
+    # memory toolset still needs its built-in store (#65429).
     _memory_toolset_requested = (
         "memory" in (agent.enabled_toolsets or [])
         and "memory" not in (agent.disabled_toolsets or [])
@@ -1345,8 +1341,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
             if not is_core_memory_provider(_mem_provider_name):
                 from agent.memory_manager import MemoryManager as _MemoryManager
+                from agent.memory_prefetch import configured_prefetch_timeout
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=configured_prefetch_timeout(mem_config),
+                    defer_prefetch_on_timeout=mem_config.get("defer_prefetch_on_timeout") is True,
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.
