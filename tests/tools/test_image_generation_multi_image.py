@@ -27,6 +27,9 @@ class _FakeHandle:
     def __init__(self, result):
         self._result = result
 
+    def iter_events(self, **_):
+        return iter(())
+
     def get(self):
         return self._result
 
