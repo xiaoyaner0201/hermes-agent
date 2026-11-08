@@ -102,7 +102,7 @@ def _hermes_signed_in() -> bool:
     """Cheap probe for a Hermes-managed openai-codex sign-in (no lock, no refresh)."""
     try:
         from plugins.web.openai_native.provider import has_codex_credentials
-    except Exception:  # noqa: BLE001 — stripped install without the sibling plugin
+    except Exception:
         return False
     return has_codex_credentials()
 
@@ -126,12 +126,12 @@ def _load_codex_auth() -> tuple[str, str | None]:
         if isinstance(access, str) and access:
             acct = tokens.get("account_id")
             return access, acct if isinstance(acct, str) and acct else None
-    except Exception:  # noqa: BLE001 — missing/invalid auth file => no auth
+    except Exception:
         pass
     return "", None
 
 
-def _send(payload: Dict[str, Any], token: str, headers: Dict[str, str]) -> Any:
+def _send(payload: dict[str, Any], token: str, headers: dict[str, str]) -> Any:
     """One POST. Hermes attaches its own sign-in when *token* is the sentinel."""
     import httpx
 
@@ -166,7 +166,7 @@ class _SignedResponse:
         return self._resp.json()
 
 
-def _post(payload: Dict[str, Any], token: str, account_id: str | None) -> Dict[str, Any]:
+def _post(payload: dict[str, Any], token: str, account_id: str | None) -> dict[str, Any]:
     """POST to the Codex search endpoint with retries on transient failures."""
     import httpx
 
@@ -198,8 +198,8 @@ def _post(payload: Dict[str, Any], token: str, account_id: str | None) -> Dict[s
             break
         if resp.status_code in (401, 403):
             raise CodexAuthExpiredError(
-                "Codex auth rejected (HTTP %d). Refresh with `codex login` / "
-                "`hermes auth add openai-codex`, or update CODEX_ACCESS_TOKEN." % resp.status_code
+                f"Codex auth rejected (HTTP {resp.status_code}). Refresh with `codex login` / "
+                "`hermes auth add openai-codex`, or update CODEX_ACCESS_TOKEN."
             )
         if resp.status_code == 429:
             raise CodexError("Codex search rate limited (HTTP 429) — try again later.")
@@ -233,7 +233,7 @@ class CodexWebSearchProvider(WebSearchProvider):
             with open(_AUTH_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             return bool((data.get("tokens") or {}).get("access_token"))
-        except Exception:  # noqa: BLE001 — any failure means "not available"
+        except Exception:
             return False
 
     def supports_search(self) -> bool:
@@ -242,7 +242,7 @@ class CodexWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return True
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Single-query lookup against the Codex retrieval backend.
 
         Returns ``{"success": True, "data": {"web": [{"title", "url",
@@ -267,7 +267,7 @@ class CodexWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": str(exc)}
 
         count = max(1, min(int(limit), 20))
-        web: List[Dict[str, Any]] = []
+        web: list[dict[str, Any]] = []
         for i, r in enumerate((body.get("results") or [])[:count]):
             title = (r.get("title") or "").strip()
             url = (r.get("url") or "").strip()
@@ -285,7 +285,7 @@ class CodexWebSearchProvider(WebSearchProvider):
         logger.info("Codex search '%s': %d results (limit %d)", query, len(web), limit)
         return {"success": True, "data": {"web": web}}
 
-    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+    def extract(self, urls: list[str], **kwargs: Any) -> list[dict[str, Any]]:
         """Open each URL through the Codex retrieval backend and return page text.
 
         Each URL is fetched with the ``open`` command using the URL itself as
@@ -297,7 +297,7 @@ class CodexWebSearchProvider(WebSearchProvider):
             msg = "Codex auth not found. Run `hermes auth add openai-codex` or `codex login`, or set CODEX_ACCESS_TOKEN."
             return [{"url": u, "error": msg} for u in urls]
 
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for url in urls:
             payload = {
                 "id": f"hermes_{uuid4().hex[:12]}",
@@ -332,7 +332,7 @@ class CodexWebSearchProvider(WebSearchProvider):
             logger.info("Codex extract %s: %d chars (cleaned %d)", url, len(raw), len(cleaned))
         return out
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Codex Search (OpenAI standalone)",
             "badge": "free",
