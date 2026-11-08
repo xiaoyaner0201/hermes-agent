@@ -49,6 +49,8 @@ def _clean_codex_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         codex_provider, "_AUTH_PATH", "/nonexistent/.codex/auth.json"
     )
+    # ...and any Hermes-managed openai-codex sign-in.
+    monkeypatch.setattr(codex_provider, "_hermes_signed_in", lambda: False)
 
 
 def _ensure_plugins_loaded() -> None:
@@ -476,3 +478,92 @@ class TestTransport:
         body = codex_provider._post({"id": "x"}, "tok", None)
         assert body == {"results": []}
         assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Hermes-managed openai-codex sign-in (main model on any provider)
+# ---------------------------------------------------------------------------
+
+
+class _FakeProviderResponse:
+    def __init__(self, status: int, payload: dict) -> None:
+        self.status = status
+        self.text = json.dumps(payload)
+        self._payload = payload
+
+    def json(self) -> dict:
+        return self._payload
+
+
+class TestHermesSignIn:
+    def test_manifest_declares_openai_codex(self) -> None:
+        import pathlib
+
+        import yaml
+
+        manifest = yaml.safe_load(
+            (pathlib.Path(codex_provider.__file__).parent / "plugin.yaml").read_text()
+        )
+        assert manifest["requires_auth"] == ["openai-codex"]
+
+    def test_available_and_preferred_over_codex_cli_file(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_auth_file(tmp_path, monkeypatch)
+        monkeypatch.setattr(codex_provider, "_hermes_signed_in", lambda: True)
+        assert codex_provider.CodexWebSearchProvider().is_available() is True
+        assert codex_provider._load_codex_auth() == (codex_provider.HERMES_SIGN_IN, None)
+
+    def test_env_token_still_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CODEX_ACCESS_TOKEN", "tok-env")
+        monkeypatch.setattr(codex_provider, "_hermes_signed_in", lambda: True)
+        assert codex_provider._load_codex_auth() == ("tok-env", None)
+
+    def test_search_goes_through_hermes_without_a_bearer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_cli import plugin_provider_requests as ppr
+
+        calls = []
+
+        def _fake_request(provider, method, url, *, json=None, headers=None, timeout=30.0):
+            calls.append((provider, method, url, json, dict(headers or {})))
+            return _FakeProviderResponse(
+                200, {"results": [{"title": "T", "url": "https://e.com", "snippet": "s"}]}
+            )
+
+        def _no_direct_post(*a, **kw):
+            raise AssertionError("direct httpx.post must not run for the Hermes sign-in")
+
+        monkeypatch.setattr(codex_provider, "_hermes_signed_in", lambda: True)
+        monkeypatch.setattr(ppr, "credentialed_provider_request", _fake_request)
+        monkeypatch.setattr(httpx, "post", _no_direct_post)
+
+        out = codex_provider.CodexWebSearchProvider().search("hermes", limit=3)
+        assert out["success"] is True
+        assert out["data"]["web"][0]["url"] == "https://e.com"
+        provider, method, url, _payload, headers = calls[0]
+        assert (provider, method, url) == ("openai-codex", "POST", codex_provider._ENDPOINT)
+        assert "Authorization" not in headers
+        assert "ChatGPT-Account-ID" not in headers
+
+    def test_retries_and_401_through_hermes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from hermes_cli import plugin_provider_requests as ppr
+
+        queue = [_FakeProviderResponse(503, {}), _FakeProviderResponse(401, {})]
+        monkeypatch.setattr(
+            ppr, "credentialed_provider_request", lambda *a, **kw: queue.pop(0)
+        )
+        with pytest.raises(codex_provider.CodexAuthExpiredError):
+            codex_provider._post({"id": "x"}, codex_provider.HERMES_SIGN_IN, None)
+        assert queue == []
+
+    def test_not_signed_in_maps_to_auth_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from hermes_cli import plugin_provider_requests as ppr
+
+        def _not_signed_in(*a, **kw):
+            raise ppr.ProviderNotSignedIn("Not signed in to Codex in Hermes.")
+
+        monkeypatch.setattr(ppr, "credentialed_provider_request", _not_signed_in)
+        with pytest.raises(codex_provider.CodexAuthExpiredError, match="Not signed in"):
+            codex_provider._post({"id": "x"}, codex_provider.HERMES_SIGN_IN, None)

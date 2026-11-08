@@ -16,12 +16,17 @@ Config keys this provider responds to::
 
 Env vars::
 
-    CODEX_ACCESS_TOKEN=...      # optional; overrides ~/.codex/auth.json
+    CODEX_ACCESS_TOKEN=...      # optional; overrides every other source
     CODEX_ACCOUNT_ID=...        # optional; multi-account setups
 
-Auth resolution order (mirrors the codex-search-opencode plugin):
+Auth resolution order:
 1. ``CODEX_ACCESS_TOKEN`` (+ optional ``CODEX_ACCOUNT_ID``)
-2. ``~/.codex/auth.json`` → ``tokens.access_token`` / ``tokens.account_id``
+2. The Hermes ``openai-codex`` sign-in (``hermes auth add openai-codex``). Hermes
+   sends the request itself through ``credentialed_provider_request`` with its
+   locked refresh; this plugin never sees the token. Works whatever the main
+   model's provider is.
+3. ``~/.codex/auth.json`` → ``tokens.access_token`` / ``tokens.account_id``
+   (read only, never refreshed)
 
 Privacy: only the search query / opened URL is sent to the retrieval
 service — never conversation history, code, or system prompt.
@@ -88,6 +93,20 @@ class CodexAuthExpiredError(CodexError):
     """Token rejected by the backend (401/403) — needs a fresh `codex login`."""
 
 
+_PROVIDER = "openai-codex"
+# Sentinel token: send through Hermes's own sign-in instead of a bearer we hold.
+HERMES_SIGN_IN = "<hermes-openai-codex>"
+
+
+def _hermes_signed_in() -> bool:
+    """Cheap probe for a Hermes-managed openai-codex sign-in (no lock, no refresh)."""
+    try:
+        from plugins.web.openai_native.provider import has_codex_credentials
+    except Exception:  # noqa: BLE001 — stripped install without the sibling plugin
+        return False
+    return has_codex_credentials()
+
+
 def _load_codex_auth() -> tuple[str, str | None]:
     """Resolve (access_token, account_id) from env, then ~/.codex/auth.json."""
     from agent.web_search_provider import get_provider_env
@@ -96,6 +115,8 @@ def _load_codex_auth() -> tuple[str, str | None]:
     account_id = get_provider_env("CODEX_ACCOUNT_ID") or None
     if token:
         return token, account_id
+    if _hermes_signed_in():
+        return HERMES_SIGN_IN, None
 
     try:
         with open(_AUTH_PATH, encoding="utf-8") as f:
@@ -110,22 +131,58 @@ def _load_codex_auth() -> tuple[str, str | None]:
     return "", None
 
 
+def _send(payload: Dict[str, Any], token: str, headers: Dict[str, str]) -> Any:
+    """One POST. Hermes attaches its own sign-in when *token* is the sentinel."""
+    import httpx
+
+    if token != HERMES_SIGN_IN:
+        return httpx.post(_ENDPOINT, json=payload, headers=headers, timeout=_TIMEOUT_S)
+
+    from hermes_cli.plugin_provider_requests import (
+        ProviderNotSignedIn,
+        credentialed_provider_request,
+    )
+
+    try:
+        resp = credentialed_provider_request(
+            _PROVIDER, "POST", _ENDPOINT, json=payload, headers=headers, timeout=_TIMEOUT_S
+        )
+    except ProviderNotSignedIn as exc:
+        raise CodexAuthExpiredError(str(exc)) from None
+    except PermissionError as exc:
+        raise CodexError(f"Hermes refused the Codex sign-in request: {exc}") from None
+    return _SignedResponse(resp)
+
+
+class _SignedResponse:
+    """``ProviderResponse`` with the ``status_code`` name ``_post`` reads."""
+
+    def __init__(self, resp: Any) -> None:
+        self.status_code = resp.status
+        self.text = resp.text
+        self._resp = resp
+
+    def json(self) -> Any:
+        return self._resp.json()
+
+
 def _post(payload: Dict[str, Any], token: str, account_id: str | None) -> Dict[str, Any]:
     """POST to the Codex search endpoint with retries on transient failures."""
     import httpx
 
     headers = {
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "User-Agent": _USER_AGENT,
     }
-    if account_id:
-        headers["ChatGPT-Account-ID"] = account_id
+    if token != HERMES_SIGN_IN:
+        headers["Authorization"] = f"Bearer {token}"
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
 
     last_err: Exception | None = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
-            resp = httpx.post(_ENDPOINT, json=payload, headers=headers, timeout=_TIMEOUT_S)
+            resp = _send(payload, token, headers)
         except httpx.RequestError as exc:
             last_err = exc
             if attempt < _MAX_RETRIES:
@@ -141,8 +198,8 @@ def _post(payload: Dict[str, Any], token: str, account_id: str | None) -> Dict[s
             break
         if resp.status_code in (401, 403):
             raise CodexAuthExpiredError(
-                "Codex auth rejected (HTTP %d). Refresh with `codex login` "
-                "or update CODEX_ACCESS_TOKEN." % resp.status_code
+                "Codex auth rejected (HTTP %d). Refresh with `codex login` / "
+                "`hermes auth add openai-codex`, or update CODEX_ACCESS_TOKEN." % resp.status_code
             )
         if resp.status_code == 429:
             raise CodexError("Codex search rate limited (HTTP 429) — try again later.")
@@ -170,7 +227,7 @@ class CodexWebSearchProvider(WebSearchProvider):
         """True when a Codex credential is present (cheap check, no network)."""
         from agent.web_search_provider import get_provider_env
 
-        if get_provider_env("CODEX_ACCESS_TOKEN"):
+        if get_provider_env("CODEX_ACCESS_TOKEN") or _hermes_signed_in():
             return True
         try:
             with open(_AUTH_PATH, encoding="utf-8") as f:
@@ -195,7 +252,7 @@ class CodexWebSearchProvider(WebSearchProvider):
         if not token:
             return {
                 "success": False,
-                "error": "Codex auth not found. Run `codex login` or set CODEX_ACCESS_TOKEN.",
+                "error": "Codex auth not found. Run `hermes auth add openai-codex` or `codex login`, or set CODEX_ACCESS_TOKEN.",
             }
 
         payload = {
@@ -237,7 +294,7 @@ class CodexWebSearchProvider(WebSearchProvider):
         """
         token, account_id = _load_codex_auth()
         if not token:
-            msg = "Codex auth not found. Run `codex login` or set CODEX_ACCESS_TOKEN."
+            msg = "Codex auth not found. Run `hermes auth add openai-codex` or `codex login`, or set CODEX_ACCESS_TOKEN."
             return [{"url": u, "error": msg} for u in urls]
 
         out: List[Dict[str, Any]] = []
@@ -279,11 +336,11 @@ class CodexWebSearchProvider(WebSearchProvider):
         return {
             "name": "Codex Search (OpenAI standalone)",
             "badge": "free",
-            "tag": "Reuses your `codex login` session — zero GPT tokens, search + extract.",
+            "tag": "Reuses your Hermes openai-codex sign-in or `codex login` — zero GPT tokens, search + extract.",
             "env_vars": [
                 {
                     "key": "CODEX_ACCESS_TOKEN",
-                    "prompt": "Codex access token (optional — defaults to ~/.codex/auth.json)",
+                    "prompt": "Codex access token (optional — defaults to the Hermes openai-codex sign-in, then ~/.codex/auth.json)",
                     "url": "https://github.com/openai/codex",
                 },
             ],

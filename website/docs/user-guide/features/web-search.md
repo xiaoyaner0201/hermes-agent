@@ -145,13 +145,15 @@ When `FIRECRAWL_API_URL` is set, the API key is optional (disable server auth wi
 
 Search and extract through OpenAI Codex's standalone web-retrieval endpoint — the same backend the Codex CLI uses. **Zero GPT inference tokens**: the operation is pure retrieval; the active Hermes model receives the raw results and does all the reasoning.
 
-**No API key required** — Hermes reuses your existing Codex CLI login:
+**No API key required.** Credentials are tried in this order:
+
+1. `CODEX_ACCESS_TOKEN` (and optionally `CODEX_ACCOUNT_ID`) in `~/.hermes/.env`.
+2. Your Hermes `openai-codex` sign-in. Hermes sends the request itself and refreshes the token under its own lock; the plugin never sees it. This works whatever provider your main model uses.
+3. The Codex CLI login in `~/.codex/auth.json`, read as-is and never refreshed.
 
 ```bash
-codex login   # creates ~/.codex/auth.json
+hermes auth add openai-codex   # or: codex login
 ```
-
-Alternatively, set `CODEX_ACCESS_TOKEN` (and optionally `CODEX_ACCOUNT_ID` for multi-account setups) in `~/.hermes/.env`. When both are present, the env var wins.
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -160,7 +162,7 @@ web:
 ```
 
 :::note
-The endpoint is an internal Codex CLI contract and may change without notice. If search returns `{"success": false}` with a 401/403 error, re-run `codex login` to refresh the token. Rate limits (HTTP 429) surface as tool errors the agent can report.
+The endpoint is an internal Codex CLI contract and may change without notice. If search returns `{"success": false}` with a 401/403 error, sign in again with `hermes auth add openai-codex` or `codex login`. Rate limits (HTTP 429) surface as tool errors the agent can report.
 :::
 
 ---
