@@ -9739,6 +9739,21 @@
             "title": "Text",
             "type": "string"
           },
+          "turn_env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Env"
+          },
           "attachments": {
             "anyOf": [
               {
@@ -11604,6 +11619,21 @@
           "text": {
             "title": "Text",
             "type": "string"
+          },
+          "turn_env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Env"
           },
           "submission_id": {
             "anyOf": [
@@ -33491,6 +33521,21 @@
             ],
             "default": null,
             "title": "Rebind Survivor Row Ids"
+          },
+          "turn_env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Env"
           }
         },
         "required": [
